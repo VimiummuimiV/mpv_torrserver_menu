@@ -79,7 +79,7 @@ When the TorrServer binary is missing, the menu offers to download it. When a ne
 
 ## Support
 
-If this saved you some effort, you can [buy me a coffee via PayPal](https://www.paypal.com/paypalme/BlendFan).
+If this saved you some effort, you can [support via PayPal](https://www.paypal.com/paypalme/BlendFan).
 
 ## License
 
