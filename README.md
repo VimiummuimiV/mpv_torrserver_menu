@@ -1,5 +1,7 @@
 # mpv-torrserver
 
+![Demo](assets/demo.gif)
+
 A [uosc](https://github.com/tomasklaen/uosc) menu for [mpv](https://mpv.io) that searches, adds, browses, and streams torrents through a local [TorrServer](https://github.com/YouROK/TorrServer) instance — no browser, no separate torrent client.
 
 > **uosc only.** This script builds its menu on top of uosc's menu API. It won't work with other mpv OSD/menu setups.
@@ -51,7 +53,7 @@ The TorrServer binary itself is **not bundled** — the script downloads and man
 Add a keybinding in your `input.conf` (this also puts the item into the uosc menu):
 
 ```
-t script-binding torrserver                 #! Torrent
+t script-binding torrserver  #! Torrent
 ```
 
 You can use any free key instead of `t` (for example `Ctrl+t`, `Alt+t`, etc.). The `#! Torrent` comment is what makes the entry appear in the uosc menu.
