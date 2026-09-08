@@ -23,8 +23,7 @@ A [uosc](https://github.com/tomasklaen/uosc) menu for [mpv](https://mpv.io) that
 
 ## Installation
 
-1. Download the [latest release](../../releases/latest) and extract it.
-2. Merge the extracted folders into your mpv config directory (`%APPDATA%\mpv\` on Windows, `~/.config/mpv/` on Linux/macOS). This release only adds the files marked below — everything else (uosc, other scripts, etc.) is your existing setup:
+1. Download the files from this repository into your mpv config directory (`%APPDATA%\mpv\` on Windows, `~/.config/mpv/` on Linux/macOS). This project only adds the files marked below — everything else (uosc, other scripts, etc.) is your existing setup:
 
    ```
    mpv/                              ← your mpv config root
@@ -33,18 +32,18 @@ A [uosc](https://github.com/tomasklaen/uosc) menu for [mpv](https://mpv.io) that
    ├── cache/
    │   └── torrserver/               ← created automatically at runtime
    ├── modules/
-   │   ├── native-dialog.lua         ← from this release
-   │   ├── platform.lua              ← from this release
-   │   ├── torrserver-update.lua     ← from this release
-   │   └── utils.lua                 ← from this release
+   │   ├── native-dialog.lua         ← from this project
+   │   ├── platform.lua              ← from this project
+   │   ├── torrserver-update.lua     ← from this project
+   │   └── utils.lua                 ← from this project
    ├── script-opts/
-   │   └── torrserver.conf           ← from this release
+   │   └── torrserver.conf           ← from this project
    └── scripts/
-       ├── torrserver.lua            ← from this release
+       ├── torrserver.lua            ← from this project
        └── uosc/                     ← required dependency, install separately
    ```
 
-3. Restart mpv.
+2. Restart mpv.
 
 The TorrServer binary itself is **not bundled** — the script downloads and manages it automatically on first use (into `~~/bin/`).
 
@@ -76,7 +75,7 @@ See the file for the full list (search timeouts/retries, metadata polling, updat
 
 ## Updating
 
-The menu shows an "Update TorrServer" entry when a new TorrServer release is available; it downloads and swaps the binary automatically. For script updates, grab the latest release from this repo and re-copy the files above.
+The menu shows an "Update TorrServer" entry when a new TorrServer release is available; it downloads and swaps the binary automatically. For script updates, pull the latest changes from this repository and re-copy the files above.
 
 ## Support
 
