@@ -12,7 +12,7 @@ A [uosc](https://github.com/tomasklaen/uosc) menu for [mpv](https://mpv.io) that
 - Filter results by size, seeds, quality, video type, content type, year, language, dub
 - Add magnet links (clipboard paste or search result) or `.torrent` files
 - History of previously played torrents, resumable from the root menu
-- Auto-manages the local TorrServer process: starts it on demand, checks for and installs updates
+- Manages the local TorrServer process: starts it on demand, checks for updates and offers to install them via the menu
 - Per-torrent file browser with playback progress
 
 ## Requirements
@@ -45,7 +45,7 @@ A [uosc](https://github.com/tomasklaen/uosc) menu for [mpv](https://mpv.io) that
 
 2. Restart mpv.
 
-The TorrServer binary itself is **not bundled** — the script downloads and manages it automatically on first use (into `~~/bin/`).
+The TorrServer binary itself is **not bundled**. On first use (when the binary is missing) the menu offers to download it; later it shows an update option with the current and new versions (into `~~/bin/`).
 
 ## Usage
 
@@ -75,7 +75,7 @@ See the file for the full list (search timeouts/retries, metadata polling, updat
 
 ## Updating
 
-The menu shows an "Update TorrServer" entry when a new TorrServer release is available; it downloads and swaps the binary automatically. For script updates, pull the latest changes from this repository and re-copy the files above.
+When the TorrServer binary is missing, the menu offers to download it. When a newer version is available, the menu shows an "Update TorrServer" entry with the current and target versions; choosing it downloads and swaps the binary. For script updates, pull the latest changes from this repository and re-copy the files above.
 
 ## Support
 
