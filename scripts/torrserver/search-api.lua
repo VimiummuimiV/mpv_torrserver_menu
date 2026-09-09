@@ -233,7 +233,7 @@ function M.new(config)
 
     local function fetch(path, server)
         local args = {
-            "curl", "--silent", "--show-error", "--fail",
+            "curl", "--silent", "--show-error", "--fail", "--ssl-revoke-best-effort",
             "--max-time", tostring(config.timeout),
             server .. path,
         }

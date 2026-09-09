@@ -221,7 +221,7 @@ function M.new(opts)
 
     function api.request_upload(filepath)
         local args = {
-            "curl", "--silent", "--show-error", "--fail",
+            "curl", "--silent", "--show-error", "--fail", "--ssl-revoke-best-effort",
             "--max-time", tostring(opts.request_timeout),
             "--retry", "5", "--retry-delay", "1", "--retry-connrefused",
             "-F", "file=@" .. curl_form_path(filepath),

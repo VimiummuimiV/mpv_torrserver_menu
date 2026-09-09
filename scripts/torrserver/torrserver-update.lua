@@ -19,7 +19,7 @@ end
 
 local function curl_base_args()
     local args = {
-        "curl", "--silent", "--show-error", "--fail",
+        "curl", "--silent", "--show-error", "--fail", "--ssl-revoke-best-effort",
         "--location",
     }
     -- Windows: avoid CRYPT_E_REVOCATION_OFFLINE when CRL/OCSP is unreachable
