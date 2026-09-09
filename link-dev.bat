@@ -14,10 +14,12 @@ if errorlevel 1 (
 )
 del "%TEMP%\mpv_symlink_test.tmp"
 
-call :link "scripts\torrserver.lua"
+call :link "scripts\torrserver\main.lua"
+call :link "scripts\torrserver\search-api.lua"
+call :link "scripts\torrserver\torrserver-api.lua"
+call :link "scripts\torrserver\torrserver-update.lua"
 call :link "modules\native-dialog.lua"
 call :link "modules\platform.lua"
-call :link "modules\torrserver-update.lua"
 call :link "modules\utils.lua"
 call :link "script-opts\torrserver.conf"
 
@@ -33,6 +35,11 @@ set "DST=%MPV%\%REL%"
 if not exist "%SRC%" (
     echo SKIP ^(missing in repo^): %SRC%
     exit /b
+)
+
+rem mklink needs the destination's parent directory to already exist
+for %%D in ("%DST%") do (
+    if not exist "%%~dpD" mkdir "%%~dpD"
 )
 
 fsutil reparsepoint query "%DST%" >nul 2>&1
