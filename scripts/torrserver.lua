@@ -48,7 +48,7 @@ local opts = {
     -- history
     history_limit = 20,
     stats_interval = 3,
-    -- metadata polling (see resolve_added_torrent)
+    -- metadata polling (see poll_metadata_async)
     metadata_retries = 5,
     metadata_retry_delay = 2,
     -- search polling (see search_torrents); 5s × 2 ≈ 10s total
@@ -61,6 +61,9 @@ local opts = {
     -- force a network call more often than this); clicking "Update TorrServer"
     -- always checks live regardless of this interval
     update_check_interval = 86400,
+    -- menu title truncation
+    elide_titles = true,
+    title_max_chars = 60,
 }
 options.read_options(opts, "torrserver")
 
@@ -134,6 +137,7 @@ local last_opened_magnet = nil
 local pending_entry = nil
 local files_back = nil -- "back" | "back_search" while in files menu
 local files_items = nil -- items currently shown in the files menu
+local metadata_poll = nil -- {cancelled, hash} while poll_metadata_async is in flight
 
 --- paths / cache -------------------------------------------------------
 
@@ -220,8 +224,6 @@ load_history()
 
 --- torrent helpers ------------------------------------------------------
 
-local title_max_chars = 60
-
 -- Returns obj[key] for the first key that isn't nil. TorrServer and the two
 -- JacRed search APIs (native v1.0, Jackett v2.0) disagree on field-name
 -- casing/spelling for the same data, so this is the one place that decides
@@ -255,18 +257,41 @@ local function utf8_codepoint(s, i)
     else return b1, 1 end
 end
 
-local function elide(str, max_chars)
-    local count, i, len = 0, 1, #str
+-- Counts codepoints; with `limit` also stops early and returns the byte
+-- prefix cut at that many codepoints (used for both length checks and the
+-- hard-cut fallback in elide()).
+local function utf8_len(s, limit)
+    local count, i, len = 0, 1, #s
     while i <= len do
-        local cp, size = utf8_codepoint(str, i)
+        local cp, size = utf8_codepoint(s, i)
         if not cp then break end
         count = count + 1
-        if count > max_chars then
-            return str:sub(1, i - 1) .. "…"
-        end
+        if limit and count > limit then return limit, s:sub(1, i - 1) end
         i = i + size
     end
-    return str
+    return count, s
+end
+
+-- Truncates to whole words: a word is kept in full once more than half of
+-- it already fits within max_chars, otherwise it's dropped entirely.
+local function elide(str, max_chars)
+    if not opts.elide_titles or utf8_len(str) <= max_chars then return str end
+    local parts, len, truncated = {}, 0, false
+    for word in str:gmatch("%S+") do
+        local sep = (#parts > 0) and 1 or 0
+        local wlen = utf8_len(word)
+        if len + sep + wlen <= max_chars then
+            parts[#parts + 1] = word
+            len = len + sep + wlen
+        else
+            local avail = max_chars - len - sep
+            if avail >= wlen / 2 then parts[#parts + 1] = word end
+            truncated = true
+            break
+        end
+    end
+    if #parts == 0 then return select(2, utf8_len(str, max_chars)) .. "…" end
+    return truncated and (table.concat(parts, " ") .. "…") or table.concat(parts, " ")
 end
 
 local function torrent_hash(torrent)
@@ -373,8 +398,10 @@ local function file_items(torrent)
     local items = {}
     for _, file in pairs(torrent_files(torrent)) do
         if type(file) == "table" then
+            local size = tonumber(field(file, "length", "Length"))
             items[#items + 1] = {
                 title = file_title(file),
+                hint = size and size > 0 and format_size(size) or nil,
                 icon = "movie",
                 value = {"loadfile", stream_url(file, hash), "replace"},
             }
@@ -623,7 +650,7 @@ local function root_menu()
     end
     if last_search and last_search.query ~= "" then
         items[#items + 1] = {
-            title = "Search: " .. elide(last_search.query, title_max_chars),
+            title = "Search: " .. elide(last_search.query, opts.title_max_chars),
             icon = "search",
             value = "show_search",
             keep_open = true,
@@ -633,7 +660,7 @@ local function root_menu()
     for _, entry in ipairs(history) do
         local is_playing = playing.hash and entry.hash and entry.hash:lower() == playing.hash
         items[#items + 1] = {
-            title = elide(entry.title, title_max_chars),
+            title = elide(entry.title, opts.title_max_chars),
             hint = stats[entry.hash],
             icon = is_playing and "play_arrow" or "movie",
             value = "history:" .. entry.hash,
@@ -663,7 +690,8 @@ local function show_files(items, back)
     local menu_items = {back_item(files_back)}
     for _, item in ipairs(items) do
         menu_items[#menu_items + 1] = {
-            title = elide(item.title, title_max_chars),
+            title = elide(item.title, opts.title_max_chars),
+            hint = item.hint,
             icon = is_playing_file(item) and "play_arrow" or "movie",
             value = item.value,
         }
@@ -1024,7 +1052,7 @@ local function search_menu(items)
     if last_search and last_search.items and #last_search.items > 0 then
         local label = filters_label()
         local filters_item = {
-            title = label and ("Filter: " .. elide(label, title_max_chars)) or "Filters",
+            title = label and ("Filter: " .. elide(label, opts.title_max_chars)) or "Filters",
             hint = results_hint(),
             icon = "filter_list",
             value = "show_filters",
@@ -1184,7 +1212,7 @@ local function build_search_items(response)
             local voices = first(info.voices, item.voices)
 
             items[#items + 1] = {
-                title = elide(title or "Untitled", title_max_chars),
+                title = elide(title or "Untitled", opts.title_max_chars),
                 hint = search_hint({
                     Tracker = tracker,
                     quality = quality,
@@ -1279,42 +1307,58 @@ end
 
 --- flows ------------------------------------------------------------
 
--- Resolves an add response into a torrent + its files; falls back to the
--- first list entry when hash is unknown (local .torrent uploads). Metadata
--- (file list) can take a few seconds to arrive after adding, so poll for it.
-local function resolve_added_torrent(response, hash)
-    local torrent = find_added_torrent(response, hash)
-    if not torrent and not hash and type(response[1]) == "table" then
-        torrent = response[1]
-    end
+-- Async metadata poll: retries up to `retries` times, `delay` seconds apart,
+-- using a timer + non-blocking subprocess (unlike with_retries) so the menu
+-- stays responsive and the wait can be cancelled (see cancel_pending_add)
+-- instead of blocking mpv while retrying. on_progress(attempt, total) fires
+-- before each try; on_done(torrent, items, error_text) fires once, or never
+-- if cancelled first.
+local function poll_metadata_async(hash, retries, delay, back, on_progress, on_done)
+    local poll = {cancelled = false, hash = hash, back = back}
+    metadata_poll = poll
+    local attempt = 0
 
-    local items = torrent and file_items(torrent) or {}
-    if #items > 0 then return torrent, items end
-
-    local error_text
-    with_retries(metadata.retries, metadata.delay,
-        function(attempt, total)
-            send_menu("update-menu", menu_data("Add torrent", {
-                {title = "Waiting for metadata (" .. attempt .. "/" .. total .. ")...", icon = "spinner", selectable = false},
-            }))
-        end,
-        function()
-            local list_response
-            list_response, error_text = request_json("POST", "/torrents", {action = "list"})
-            if not list_response then return false end
-            torrent = find_added_torrent(list_response, hash)
-            if not torrent and not hash and type(list_response[1]) == "table" then
-                torrent = list_response[1]
+    local function step()
+        if poll.cancelled then return end
+        attempt = attempt + 1
+        on_progress(attempt, retries)
+        local args = torr_server_request_args("POST", "/torrents", {action = "list"})
+        platform.run_subprocess_async(args, function(success, result, err)
+            if poll.cancelled then return end
+            local torrent, items, error_text
+            if success and result and result.status == 0 then
+                local ok, list_response = pcall(utils.parse_json, result.stdout or "")
+                if ok and list_response then
+                    torrent = find_added_torrent(list_response, hash)
+                    if not torrent and not hash and type(list_response[1]) == "table" then
+                        torrent = list_response[1]
+                    end
+                    items = torrent and file_items(torrent) or {}
+                else
+                    error_text = "invalid JSON response"
+                end
+            else
+                error_text = result and (result.stderr or result.error_string) or (err and tostring(err)) or "no response"
             end
-            items = torrent and file_items(torrent) or {}
-            return #items > 0
+
+            if items and #items > 0 then
+                metadata_poll = nil
+                on_done(torrent, items, nil)
+            elseif attempt >= retries then
+                metadata_poll = nil
+                on_done(torrent, items or {}, error_text)
+            else
+                mp.add_timeout(delay, step)
+            end
         end)
-    return torrent, items, error_text
+    end
+    step()
 end
 
-local function begin_add()
+local function begin_add(back)
     if not start_torrserver() then return false end
     send_menu("update-menu", menu_data("Add torrent", {
+        back_item(back),
         {title = "Adding torrent...", icon = "spinner", selectable = false},
     }))
     return true
@@ -1345,22 +1389,42 @@ local function finish_add(response, error_text, hash, fallback_title, source, ba
         return
     end
 
-    local torrent, items
-    torrent, items, error_text = resolve_added_torrent(response, hash)
-    if not torrent or #items == 0 then
-        -- Torrent was already added to TorrServer (save_to_db=true); with no
-        -- files to show there's nothing pending to discard it later, so it
-        -- would otherwise sit there orphaned. Clean it up now instead.
-        local orphan_hash = (torrent and torrent_hash(torrent)) or hash
-        if orphan_hash then remove_torrent(orphan_hash) end
-        show_error(error_text or "no files found")
-        back_to_previous(back)
+    -- Completes the flow once a torrent (with files) is known, whether that
+    -- came back immediately or after polling for metadata.
+    local function complete(torrent, items, poll_error)
+        if not torrent or #items == 0 then
+            -- Torrent was already added to TorrServer (save_to_db=true); with no
+            -- files to show there's nothing pending to discard it later, so it
+            -- would otherwise sit there orphaned. Clean it up now instead.
+            local orphan_hash = (torrent and torrent_hash(torrent)) or hash
+            if orphan_hash then remove_torrent(orphan_hash) end
+            show_error(poll_error or "no files found")
+            back_to_previous(back)
+            return
+        end
+        local title = torrent_title(torrent) or fallback_title
+        pending_entry = {hash = torrent_hash(torrent) or hash, title = title, items = items, source = source}
+        show_files(items, back)
+    end
+
+    local torrent = find_added_torrent(response, hash)
+    if not torrent and not hash and type(response[1]) == "table" then
+        torrent = response[1]
+    end
+    local items = torrent and file_items(torrent) or {}
+    if #items > 0 then
+        complete(torrent, items)
         return
     end
 
-    local title = torrent_title(torrent) or fallback_title
-    pending_entry = {hash = torrent_hash(torrent) or hash, title = title, items = items, source = source}
-    show_files(items, back)
+    -- Metadata (file list) can take a few seconds to arrive after adding, so
+    -- poll for it; cancel_pending_add() can abort this while it's running.
+    poll_metadata_async(hash, metadata.retries, metadata.delay, back, function(attempt, total)
+        send_menu("update-menu", menu_data("Add torrent", {
+            back_item(back),
+            {title = "Waiting for metadata (" .. attempt .. "/" .. total .. ")...", icon = "spinner", selectable = false},
+        }))
+    end, complete)
 end
 
 local function add_magnet(magnet, source, back)
@@ -1368,7 +1432,7 @@ local function add_magnet(magnet, source, back)
         show_error("clipboard does not contain a magnet link")
         return
     end
-    if not begin_add() then return end
+    if not begin_add(back) then return end
 
     local hash = magnet_hash(magnet)
     local response, error_text = request_json("POST", "/torrents", {
@@ -1513,6 +1577,22 @@ local function discard_pending()
     end
 end
 
+-- Undoes an add that hasn't been committed to history yet, whichever stage
+-- it's at: an in-flight metadata poll (see poll_metadata_async) or an
+-- already-resolved pending_entry. Returns the poll's back target, if any,
+-- so callers don't need to inspect metadata_poll themselves.
+local function cancel_pending_add()
+    local back
+    if metadata_poll then
+        metadata_poll.cancelled = true
+        back = metadata_poll.back
+        if metadata_poll.hash then remove_torrent(metadata_poll.hash) end
+        metadata_poll = nil
+    end
+    discard_pending()
+    return back
+end
+
 local function open_history_entry(hash)
     local entry = find_history(hash)
     if not entry then
@@ -1584,6 +1664,7 @@ local function update_torrserver()
     local installed = updater.installed_version(bin_path)
 
     send_menu("update-menu", menu_data("Add torrent", {
+        back_item(),
         {title = "Checking for TorrServer updates...", icon = "spinner", selectable = false},
     }))
     -- Bypasses the passive TTL cache: an explicit click should always check live.
@@ -1605,6 +1686,7 @@ local function update_torrserver()
         local label = "Downloading TorrServer " .. release.version .. "..."
         if percent then label = label .. " " .. percent .. "%" end
         send_menu("update-menu", menu_data("Add torrent", {
+            back_item(),
             {title = label, icon = "spinner", selectable = false},
         }))
     end, function(ok, download_error)
@@ -1669,8 +1751,12 @@ mp.register_script_message("torrserver-menu-event", function(json)
         return
     end
     if event.type == "back" then
-        discard_pending()
-        if menu_view == "filters" or (menu_view == "files" and files_back == "back_search") then
+        -- menu_view hasn't switched to "files" yet while a metadata poll is
+        -- in flight, so its own back target decides where to land instead.
+        local poll_back = cancel_pending_add()
+        if poll_back then
+            back_to_previous(poll_back)
+        elseif menu_view == "filters" or (menu_view == "files" and files_back == "back_search") then
             render_search_menu(true)
         else
             return_to_root()
@@ -1683,6 +1769,7 @@ mp.register_script_message("torrserver-menu-event", function(json)
         local hash = history_hash(event.value)
         if hash then
             send_menu("update-menu", menu_data("Add torrent", {
+                back_item(),
                 {title = "Removing torrent...", icon = "spinner", selectable = false},
             }))
             if remove_torrent(hash) then
@@ -1772,7 +1859,7 @@ mp.register_script_message("torrserver-menu-event", function(json)
     elseif event.value == "cycle_sort" then
         cycle_sort()
     elseif event.value == "show_search" or event.value == "back_search" then
-        discard_pending()
+        cancel_pending_add()
         render_search_menu(true)
     elseif event.value == "show_filters" then
         clear_search()
@@ -1791,7 +1878,7 @@ mp.register_script_message("torrserver-menu-event", function(json)
     elseif is_magnet(event.value) then
         add_magnet(event.value, last_search and last_search.urls and last_search.urls[event.value], "back_search")
     elseif event.value == "back" then
-        discard_pending()
+        cancel_pending_add()
         return_to_root()
     else
         local hash = history_hash(event.value)
