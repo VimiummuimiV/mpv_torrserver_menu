@@ -236,17 +236,6 @@ local function field(obj, ...)
     return nil
 end
 
--- Same idea as field(), but for picking between two already-fetched values
--- (e.g. a nested info.* table vs. a flat top-level one) rather than keys on
--- a single object.
-local function first(...)
-    for i = 1, select("#", ...) do
-        local v = select(i, ...)
-        if v ~= nil then return v end
-    end
-    return nil
-end
-
 local function utf8_codepoint(s, i)
     local b1 = s:byte(i)
     if not b1 then return nil, 0 end
@@ -704,10 +693,127 @@ end
 
 --- search -----------------------------------------------------------
 
--- item.Tracker can list several trackers for one release, comma-separated
--- (e.g. "rutracker, torrentby, bitru, rutor"); this is the one Details links to.
+-- JacRed search API field maps. Only mapped keys are read by api_field /
+-- normalize_search_item; the comment blocks list every property observed in
+-- real responses so unused fields are visible when extending.
+--
+-- Field aliases are ordered: preferred key first, then fallbacks.
+local search_api_fields = {
+    -- Native v1.0  GET /api/v1.0/torrents?search=...&apikey=...
+    -- Response: JSON array of objects (empty object {} when no results).
+    --   tracker      string    tracker slug (e.g. "korsars", "rutor", "bitru")
+    --   url          string    details page URL
+    --   title        string    full release title
+    --   size         number    size in bytes
+    --   sizeName     string    human-readable size (e.g. "11.9 GB")
+    --   createTime   string    ISO timestamp first seen
+    --   updateTime   string    ISO timestamp last updated
+    --   sid          number    seeders
+    --   pir          number    peers/leechers
+    --   magnet       string    magnet URI
+    --   name         string    normalized title (localized)
+    --   originalname string    original (usually English) title
+    --   released     number    release year
+    --   videotype    string    "sdr" | "hdr" | ...
+    --   quality      number    resolution: 480, 720, 1080, 2160
+    --   voices       string[]  dubbing/voice tags (e.g. "Дубляж", studio names)
+    --   seasons      number[]  season numbers (empty for movies)
+    --   types        string[]  content tags: "movie", "serial", "tvshow",
+    --                          "documovie", "docuserial", "anime", "ova", "ona",
+    --                          "multfilm", "multserial"
+    -- Not present on v1.0: languages, ffprobe, Category, nested info.
+    native = {
+        list = nil, -- direct array
+        tracker   = {"tracker"},
+        url       = {"url"},
+        title     = {"title"},
+        size      = {"size"},
+        seeders   = {"sid"},
+        peers     = {"pir"},
+        magnet    = {"magnet"},
+        quality   = {"quality"},
+        videotype = {"videotype"},
+        types     = {"types"},
+        released  = {"relased", "released"},
+        languages = nil, -- not present on v1.0
+        voices    = {"voices"},
+    },
+    -- Jackett v2.0  GET /api/v2.0/indexers/all/results?query=...&apikey=...
+    -- Response: { Results = [ ... ], Error = null|string }.
+    --   Tracker      string    tracker slug(s), comma-separated when merged
+    --   Details      string    details page URL (primary)
+    --   Title        string    full release title
+    --   Size         number    size in bytes
+    --   PublishDate  string    ISO publication timestamp
+    --   Category     number[]  Jackett category IDs (2000=Movies, 5000=TV, ...)
+    --   CategoryDesc string    human-readable category
+    --   Seeders      number    seeders
+    --   Peers        number    peers/leechers
+    --   MagnetUri    string    magnet URI
+    --   ffprobe      object[]  optional media stream metadata (codec, width,
+    --                          height, language, bit_rate, tags, ...)
+    --   languages    string[]  audio/subtitle language codes (e.g. "rus", "eng")
+    --   info         object    enriched JacRed metadata (may be absent):
+    --     info.quality      number    resolution: 480, 720, 1080, 2160
+    --     info.videotype    string    "sdr" | "hdr" | ...
+    --     info.voices       string[]  dubbing/voice tags
+    --     info.types        string[]  content tags (same set as native)
+    --     info.released     number    release year (API typo; 0 when unknown)
+    --     info.name         string    normalized title (localized)
+    --     info.originalname string    original title
+    --     info.sizeName     string    human-readable size
+    --     info.seasons      number[]  season numbers
+    -- Occasional aliases seen in the wild: Link (url), Magnet (magnet),
+    -- quality/videotype/types/released/voices at top level when info is missing.
+    jackett = {
+        list      = "Results",
+        tracker   = {"Tracker"},
+        url       = {"Details"},
+        title     = {"Title"},
+        size      = {"Size"},
+        seeders   = {"Seeders"},
+        peers     = {"Peers"},
+        magnet    = {"MagnetUri"},
+        quality   = {"info.quality"},
+        videotype = {"info.videotype"},
+        types     = {"info.types"},
+        released  = {"info.relased", "info.released"},
+        languages = {"languages"},
+        voices    = {"info.voices"},
+    },
+}
+
+local function field_path(obj, path)
+    local cur = obj
+    for part in path:gmatch("[^%.]+") do
+        if type(cur) ~= "table" then return nil end
+        cur = cur[part]
+        if cur == nil then return nil end
+    end
+    return cur
+end
+
+-- Prefer the active API map, fall back to the other so mixed responses still work.
+local function api_field(item, key)
+    local primary = search_api == "jackett" and search_api_fields.jackett or search_api_fields.native
+    local secondary = search_api == "jackett" and search_api_fields.native or search_api_fields.jackett
+    for _, map in ipairs({primary, secondary}) do
+        local aliases = map[key]
+        if type(aliases) == "table" then
+            for _, alias in ipairs(aliases) do
+                local v = alias:find("%.") and field_path(item, alias) or item[alias]
+                if v ~= nil then return v end
+            end
+        end
+    end
+    return nil
+end
+
+-- Tracker string may list several trackers for one release, comma-separated
+-- (e.g. "rutracker, torrentby, bitru, rutor"); Details links to the first.
 local function raw_tracker(item)
-    return field(item, "Tracker", "tracker")
+    if type(item) == "string" then return item end
+    return api_field(item, "tracker")
 end
 
 local function first_tracker(item)
@@ -739,7 +845,7 @@ local function other_trackers(item)
 end
 
 local function search_source_url(item)
-    local url = field(item, "Details", "Link", "url")
+    local url = api_field(item, "url")
     return url and url:match("^https?://") and url or nil
 end
 
@@ -1169,71 +1275,86 @@ local function quality_label(quality)
     return quality and tostring(quality) or nil
 end
 
-local function search_hint(item)
+local function search_hint(normalized)
     local parts = {}
-    local tracker = first_tracker(item)
+    local tracker = first_tracker(normalized.tracker)
     if tracker then
-        local count = tracker_count(item)
+        local count = tracker_count(normalized.tracker)
         parts[#parts + 1] = count > 1 and (tracker .. " +" .. (count - 1)) or tracker
     end
-    local q = quality_label(item.quality)
+    local q = quality_label(normalized.quality)
     if q then parts[#parts + 1] = q end
-    if item.Size then parts[#parts + 1] = format_size(item.Size) end
-    parts[#parts + 1] = "S:" .. tostring(item.Seeders or 0) .. " P:" .. tostring(item.Peers or 0)
+    if normalized.size and normalized.size > 0 then
+        parts[#parts + 1] = format_size(normalized.size)
+    end
+    parts[#parts + 1] = "S:" .. tostring(normalized.seeders or 0)
+        .. " P:" .. tostring(normalized.peers or 0)
     return table.concat(parts, " · ")
+end
+
+-- Normalize one raw API item into the internal shape used by filters, sort,
+-- and the menu. All API-specific field names stay in search_api_fields / api_field.
+local function normalize_search_item(item)
+    local magnet = api_field(item, "magnet")
+    if not magnet then return nil end
+
+    local tracker = api_field(item, "tracker")
+    local title = api_field(item, "title")
+    local size = tonumber(api_field(item, "size")) or 0
+    local seeders = tonumber(api_field(item, "seeders")) or 0
+    local peers = tonumber(api_field(item, "peers")) or 0
+    local quality = tonumber(api_field(item, "quality"))
+    local videotype = api_field(item, "videotype")
+    local types = api_field(item, "types")
+    local released = tonumber(api_field(item, "released"))
+    local languages = api_field(item, "languages")
+    local voices = api_field(item, "voices")
+    local url = search_source_url(item)
+
+    local actions = {{name = "copy_magnet", icon = "content_copy", label = "Copy magnet link"}}
+    if url then
+        local label = "Open on " .. (first_tracker(tracker) or "site")
+        local others = other_trackers(tracker)
+        if others then label = label .. " (also on: " .. others .. ")" end
+        table.insert(actions, 1, {name = "open_source", icon = "open_in_new", label = label})
+    end
+
+    return {
+        title = elide(title or "Untitled", opts.title_max_chars),
+        hint = search_hint({
+            tracker = tracker,
+            quality = quality,
+            size = size,
+            seeders = seeders,
+            peers = peers,
+        }),
+        icon = "movie",
+        value = magnet,
+        keep_open = true,
+        actions = actions,
+        size = size,
+        seeders = seeders,
+        peers = peers,
+        quality = quality,
+        videotype = videotype and tostring(videotype):lower() or nil,
+        types = types,
+        released = released,
+        languages = languages,
+        voices = voices,
+        source_url = url,
+    }
 end
 
 local function build_search_items(response)
     local items, urls = {}, {}
     for _, item in ipairs(response_list(response) or {}) do
-        local magnet = field(item, "MagnetUri", "Magnet", "magnet")
-        if magnet then
-            local url = search_source_url(item)
-            local actions = {{name = "copy_magnet", icon = "content_copy", label = "Copy magnet link"}}
-            if url then
-                local label = "Open on " .. (first_tracker(item) or "site")
-                local others = other_trackers(item)
-                if others then label = label .. " (also on: " .. others .. ")" end
-                table.insert(actions, 1, {name = "open_source", icon = "open_in_new", label = label})
-                urls[magnet] = url
+        local normalized = normalize_search_item(item)
+        if normalized then
+            if normalized.source_url then
+                urls[normalized.value] = normalized.source_url
             end
-
-            local info = type(item.info) == "table" and item.info or {}
-            local tracker = raw_tracker(item)
-            local title = field(item, "Title", "title")
-            local size = field(item, "Size", "size")
-            local seeders = field(item, "Seeders", "Seed", "sid")
-            local peers = field(item, "Peers", "Peer", "pir")
-            local quality = first(info.quality, item.quality)
-            local videotype = first(info.videotype, item.videotype)
-            local types = first(info.types, item.types)
-            local released = first(info.relased, item.relased)
-            local languages = item.languages
-            local voices = first(info.voices, item.voices)
-
-            items[#items + 1] = {
-                title = elide(title or "Untitled", opts.title_max_chars),
-                hint = search_hint({
-                    Tracker = tracker,
-                    quality = quality,
-                    Size = size,
-                    Seeders = seeders,
-                    Peers = peers,
-                }),
-                icon = "movie",
-                value = magnet,
-                keep_open = true,
-                actions = actions,
-                size = tonumber(size) or 0,
-                seeders = tonumber(seeders) or 0,
-                peers = tonumber(peers) or 0,
-                quality = tonumber(quality),
-                videotype = videotype and tostring(videotype):lower() or nil,
-                types = types,
-                released = tonumber(released),
-                languages = languages,
-                voices = voices,
-            }
+            normalized.source_url = nil
+            items[#items + 1] = normalized
         end
     end
     return items, urls
