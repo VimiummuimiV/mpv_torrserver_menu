@@ -1,4 +1,4 @@
-# mpv-torrserver
+# mpv-torrserver-menu
 
 ![Demo](assets/demo.gif)
 
