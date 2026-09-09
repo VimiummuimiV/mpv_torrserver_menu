@@ -400,7 +400,7 @@ local function root_menu()
             separator = true,
         }
     end
-    for _, entry in ipairs(history) do
+    for i, entry in ipairs(history) do
         local is_playing = playing.hash and entry.hash and entry.hash:lower() == playing.hash
         items[#items + 1] = {
             title = elide(entry.title, opts.title_max_chars),
@@ -409,6 +409,16 @@ local function root_menu()
             value = "history:" .. entry.hash,
             keep_open = true,
             actions = history_actions(entry),
+            separator = i == #history and #history > 1 or nil,
+        }
+    end
+    -- Only worth offering once there's more than one entry in the history.
+    if #history > 1 then
+        items[#items + 1] = {
+            title = "Remove all torrents",
+            icon = "delete_sweep",
+            value = "wipe_torrents",
+            keep_open = true,
         }
     end
     return menu_data("Add torrent", items)
@@ -1122,6 +1132,25 @@ function remove_torrent(hash)
     return ok
 end
 
+-- "Remove all torrents": wipes everything TorrServer knows about in one call,
+-- rather than dropping/removing each history entry individually.
+local function wipe_all_torrents()
+    send_menu("update-menu", menu_data("Add torrent", {
+        back_item(),
+        {title = "Removing all torrents...", icon = "spinner", selectable = false},
+    }))
+    if playing.hash then mp.commandv("stop") end
+    local ok, error_text = torrserver.wipe()
+    if not ok then
+        show_error("could not remove all torrents: " .. (error_text or ""))
+    else
+        history = {}
+        stats = {}
+        save_history()
+    end
+    send_menu("update-menu", root_menu())
+end
+
 -- Leaving the file list without playing anything means the user didn't want
 -- that torrent after all, so undo what save_to_db=true persisted in TorrServer.
 local function discard_pending()
@@ -1397,6 +1426,8 @@ mp.register_script_message("torrserver-menu-event", function(json)
         if start_torrserver() then open_torrserver_ui() end
     elseif event.value == "update_torrserver" then
         update_torrserver()
+    elseif event.value == "wipe_torrents" then
+        wipe_all_torrents()
     elseif event.value == "add_torrent_file" then
         local filepath = browse_torrent_file()
         if filepath then

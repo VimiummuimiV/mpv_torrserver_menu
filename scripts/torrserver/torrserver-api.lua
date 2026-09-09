@@ -8,7 +8,8 @@
 --     rem   removes a torrent permanently
 --     drop  stops a torrent's downloads without removing it (used before rem,
 --           since TorrServer refuses to rem a torrent that's still streaming)
---     get/set/wipe are not used by this script
+--     wipe  removes every torrent at once ("Remove all torrents" in the menu)
+--     get/set are not used by this script
 --   link, hash, title, poster, data, save_to_db are the other request fields;
 --   only link (add), hash (rem/drop), and save_to_db (add) are used here.
 --
@@ -49,6 +50,7 @@ M.actions = {
     add = "add",
     remove = "rem",
     drop = "drop",
+    wipe = "wipe",
 }
 local torrent_fields = {
     hash = {"hash", "infohash", "id"},
@@ -346,6 +348,12 @@ function M.new(opts)
 
     function api.add(link)
         return api.request_json("POST", paths.torrents, {action = M.actions.add, link = link, save_to_db = true})
+    end
+
+    -- Removes every torrent TorrServer knows about, in one call.
+    function api.wipe()
+        local _, error_text = api.request_json("POST", paths.torrents, {action = M.actions.wipe})
+        return error_text == nil, error_text
     end
 
     return api
