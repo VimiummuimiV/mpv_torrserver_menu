@@ -222,6 +222,63 @@ end
 
 load_history()
 
+--- TorrServer API ------------------------------------------------------
+
+-- TorrServer's own HTTP API (distinct from the JacRed search APIs below).
+-- Full reference: https://github.com/YouROK/TorrServer/wiki
+--
+-- POST /torrents  { action, link, hash, title, poster, data, save_to_db }
+--   action  "add" | "get" | "set" | "rem" | "list" | "drop" | "wipe"
+--     add   adds a torrent (link = magnet/hash/URL); returns the torrent object
+--     list  returns every torrent as a JSON array
+--     rem   removes a torrent permanently
+--     drop  stops a torrent's downloads without removing it (used before rem,
+--           since TorrServer refuses to rem a torrent that's still streaming)
+--     get/set/wipe are not used by this script
+--   link, hash, title, poster, data, save_to_db are the other request fields;
+--   only link (add), hash (rem/drop), and save_to_db (add) are used here.
+--
+--   Torrent object fields actually read by this script:
+--     hash / infohash / id             string  info hash
+--     title / Title / name             string  torrent title
+--     data                             string  custom JSON, may embed a
+--                                               nested TorrServer.Title
+--     file_stats / files / filelist    array   files in the torrent
+--   File object fields actually read by this script:
+--     length / Length                  number  file size in bytes
+--     path / name / title              string  file path/name within torrent
+--     id / index / num                 number  file index (defaults to 0)
+--
+-- POST /torrent/upload  (multipart form)
+--   file          the .torrent file
+--   save_to_db    true/false
+--
+-- GET /stream/{path}?link={hash}&index={index}&play
+--   Streams a single file from an added torrent.
+local torrserver_api = {
+    paths = {
+        torrents = "/torrents",
+        upload = "/torrent/upload",
+        stream = "/stream/",
+    },
+    actions = {
+        list = "list",
+        add = "add",
+        remove = "rem",
+        drop = "drop",
+    },
+    torrent_fields = {
+        hash = {"hash", "infohash", "id"},
+        title = {"title", "Title", "name"},
+        files = {"file_stats", "files", "filelist"},
+    },
+    file_fields = {
+        length = {"length", "Length"},
+        path = {"path", "name", "title"},
+        index = {"id", "index", "num"},
+    },
+}
+
 --- torrent helpers ------------------------------------------------------
 
 -- Returns obj[key] for the first key that isn't nil. TorrServer and the two
@@ -234,6 +291,14 @@ local function field(obj, ...)
         if v ~= nil then return v end
     end
     return nil
+end
+
+local function torrent_field(torrent, key)
+    return field(torrent, unpack(torrserver_api.torrent_fields[key]))
+end
+
+local function file_field(file, key)
+    return field(file, unpack(torrserver_api.file_fields[key]))
 end
 
 local function utf8_codepoint(s, i)
@@ -284,11 +349,11 @@ local function elide(str, max_chars)
 end
 
 local function torrent_hash(torrent)
-    return field(torrent, "hash", "infohash", "id")
+    return torrent_field(torrent, "hash")
 end
 
 local function torrent_title(torrent)
-    local title = field(torrent, "title", "Title", "name")
+    local title = torrent_field(torrent, "title")
     if title then return title end
 
     if type(torrent.data) == "string" then
@@ -301,7 +366,7 @@ local function torrent_title(torrent)
 end
 
 local function torrent_files(torrent)
-    local files = field(torrent, "file_stats", "files", "filelist")
+    local files = torrent_field(torrent, "files")
     if type(files) == "table" then return files end
 
     local data = torrent.data
@@ -373,12 +438,12 @@ local function encode_path(path)
 end
 
 local function file_title(file)
-    return file.path or file.name or file.title or ("File " .. tostring(file.id or "?"))
+    return file_field(file, "path") or ("File " .. tostring(file_field(file, "index") or "?"))
 end
 
 local function stream_url(file, hash)
-    local index = file.id or file.index or file.num or 0
-    return torr_server_base .. "/stream/" .. encode_path(file_title(file))
+    local index = file_field(file, "index") or 0
+    return torr_server_base .. torrserver_api.paths.stream .. encode_path(file_title(file))
         .. "?link=" .. hash .. "&index=" .. tostring(index) .. "&play"
 end
 
@@ -387,7 +452,7 @@ local function file_items(torrent)
     local items = {}
     for _, file in pairs(torrent_files(torrent)) do
         if type(file) == "table" then
-            local size = tonumber(field(file, "length", "Length"))
+            local size = tonumber(file_field(file, "length"))
             items[#items + 1] = {
                 title = file_title(file),
                 hint = size and size > 0 and format_size(size) or nil,
@@ -538,7 +603,7 @@ local function request_upload(filepath)
         "--retry", "5", "--retry-delay", "1", "--retry-connrefused",
         "-F", "file=@" .. curl_form_path(filepath),
         "-F", "save_to_db=true",
-        torr_server_base .. "/torrent/upload",
+        torr_server_base .. torrserver_api.paths.upload,
     }
     local output, error_text = run_curl(args)
     if not output then return nil, error_text end
@@ -1443,7 +1508,7 @@ local function poll_metadata_async(hash, retries, delay, back, on_progress, on_d
         if poll.cancelled then return end
         attempt = attempt + 1
         on_progress(attempt, retries)
-        local args = torr_server_request_args("POST", "/torrents", {action = "list"})
+        local args = torr_server_request_args("POST", torrserver_api.paths.torrents, {action = torrserver_api.actions.list})
         platform.run_subprocess_async(args, function(success, result, err)
             if poll.cancelled then return end
             local torrent, items, error_text
@@ -1556,8 +1621,8 @@ local function add_magnet(magnet, source, back)
     if not begin_add(back) then return end
 
     local hash = magnet_hash(magnet)
-    local response, error_text = request_json("POST", "/torrents", {
-        action = "add",
+    local response, error_text = request_json("POST", torrserver_api.paths.torrents, {
+        action = torrserver_api.actions.add,
         link = magnet,
         save_to_db = true,
     })
@@ -1599,7 +1664,7 @@ local function refresh_stats()
     if menu_view ~= "root" then return end
     if stats_refresh_in_flight then return end
     stats_refresh_in_flight = true
-    local args = torr_server_request_args("POST", "/torrents", {action = "list"})
+    local args = torr_server_request_args("POST", torrserver_api.paths.torrents, {action = torrserver_api.actions.list})
     platform.run_subprocess_async(args, function(success, result, err)
         stats_refresh_in_flight = false
         if not success or not result or result.status ~= 0 then return end
@@ -1662,7 +1727,7 @@ end
 
 local function torrent_action(action, hash, error_prefix)
     if not start_torrserver() then return false end
-    local _, error_text = request_json("POST", "/torrents", {action = action, hash = hash})
+    local _, error_text = request_json("POST", torrserver_api.paths.torrents, {action = action, hash = hash})
     if error_text then
         show_error(error_prefix .. ": " .. error_text)
         return false
@@ -1677,7 +1742,7 @@ local function stop_if_playing(hash)
 end
 
 local function drop_torrent(hash)
-    local ok = torrent_action("drop", hash, "could not stop torrent")
+    local ok = torrent_action(torrserver_api.actions.drop, hash, "could not stop torrent")
     if ok then stop_if_playing(hash) end
     return ok
 end
@@ -1686,7 +1751,7 @@ end
 -- drop it first to release the reader.
 function remove_torrent(hash)
     drop_torrent(hash)
-    return torrent_action("rem", hash, "could not remove torrent from TorrServer")
+    return torrent_action(torrserver_api.actions.remove, hash, "could not remove torrent from TorrServer")
 end
 
 -- Leaving the file list without playing anything means the user didn't want
