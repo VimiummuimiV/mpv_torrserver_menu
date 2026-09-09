@@ -34,12 +34,15 @@ A [uosc](https://github.com/tomasklaen/uosc) menu for [mpv](https://mpv.io) that
    ├── modules/
    │   ├── native-dialog.lua         ← from this project
    │   ├── platform.lua              ← from this project
-   │   ├── torrserver-update.lua     ← from this project
    │   └── utils.lua                 ← from this project
    ├── script-opts/
    │   └── torrserver.conf           ← from this project
    └── scripts/
-       ├── torrserver.lua            ← from this project
+       ├── torrserver/
+       │   ├── main.lua               ← from this project (entry point)
+       │   ├── search-api.lua         ← from this project (JacRed search API client)
+       │   ├── torrserver-api.lua     ← from this project (TorrServer HTTP API + process management)
+       │   └── torrserver-update.lua  ← from this project (TorrServer release/update management)
        └── uosc/                     ← required dependency, install separately
    ```
 
