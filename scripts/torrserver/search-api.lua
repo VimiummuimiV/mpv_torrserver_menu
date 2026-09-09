@@ -50,7 +50,7 @@ local search_api_fields = {
         quality   = {"quality"},
         videotype = {"videotype"},
         types     = {"types"},
-        released  = {"relased", "released"},
+        released  = {"relased", "released"}, -- API typo: sometimes "relased" instead of "released"
         languages = nil, -- not present on v1.0
         voices    = {"voices"},
     },
@@ -92,7 +92,7 @@ local search_api_fields = {
         quality   = {"info.quality"},
         videotype = {"info.videotype"},
         types     = {"info.types"},
-        released  = {"info.relased", "info.released"},
+        released  = {"info.relased", "info.released"}, -- API typo: sometimes "info.relased" instead of "info.released"
         languages = {"languages"},
         voices    = {"info.voices"},
     },
