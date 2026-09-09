@@ -78,4 +78,79 @@ local function pretty_json(json_str)
 end
 M.pretty_json = pretty_json
 
+function M.encode_path(path)
+    local encoded = {}
+    for part in path:gmatch("[^/]+") do
+        encoded[#encoded + 1] = part:gsub("([^%w%._%-~])", function(char)
+            return string.format("%%%02X", char:byte())
+        end)
+    end
+    return table.concat(encoded, "/")
+end
+
+function M.format_size(bytes)
+    bytes = tonumber(bytes) or 0
+    if bytes <= 0 then return "0 B" end
+    local units = {"B", "KB", "MB", "GB", "TB"}
+    local i = 1
+    while bytes >= 1024 and i < #units do
+        bytes = bytes / 1024
+        i = i + 1
+    end
+    return string.format(i == 1 and "%d %s" or "%.2f %s", bytes, units[i])
+end
+
+function M.format_speed(bytes_per_sec)
+    bytes_per_sec = tonumber(bytes_per_sec) or 0
+    if bytes_per_sec <= 0 then return "--" end
+    return M.format_size(bytes_per_sec) .. "/s"
+end
+
+local function utf8_codepoint(s, i)
+    local b1 = s:byte(i)
+    if not b1 then return nil, 0 end
+    if b1 < 0x80 then return b1, 1
+    elseif b1 >= 0xF0 then return b1, 4
+    elseif b1 >= 0xE0 then return b1, 3
+    elseif b1 >= 0xC0 then return b1, 2
+    else return b1, 1 end
+end
+
+-- Counts codepoints; with `limit` also stops early and returns the byte
+-- prefix cut at that many codepoints (used for both length checks and the
+-- hard-cut fallback in M.elide()).
+local function utf8_len(s, limit)
+    local count, i, len = 0, 1, #s
+    while i <= len do
+        local cp, size = utf8_codepoint(s, i)
+        if not cp then break end
+        count = count + 1
+        if limit and count > limit then return limit, s:sub(1, i - 1) end
+        i = i + size
+    end
+    return count, s
+end
+
+-- Truncates to whole words: a word is kept in full once more than half of
+-- it already fits within max_chars, otherwise it's dropped entirely.
+function M.elide(str, max_chars, enabled)
+    if enabled == false or utf8_len(str) <= max_chars then return str end
+    local parts, len, truncated = {}, 0, false
+    for word in str:gmatch("%S+") do
+        local sep = (#parts > 0) and 1 or 0
+        local wlen = utf8_len(word)
+        if len + sep + wlen <= max_chars then
+            parts[#parts + 1] = word
+            len = len + sep + wlen
+        else
+            local avail = max_chars - len - sep
+            if avail >= wlen / 2 then parts[#parts + 1] = word end
+            truncated = true
+            break
+        end
+    end
+    if #parts == 0 then return select(2, utf8_len(str, max_chars)) .. "…" end
+    return truncated and (table.concat(parts, " ") .. "…") or table.concat(parts, " ")
+end
+
 return M

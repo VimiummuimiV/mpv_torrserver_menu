@@ -6,11 +6,13 @@
 -- Search:
 --   JacRed API: Native v1.0 or Jackett v2.0.
 --
--- Supporting modules:
---   modules/native-dialog.lua      Cross-platform .torrent file picker.
---   modules/platform.lua           OS and architecture detection.
---   modules/torrserver-update.lua  TorrServer release/update management.
---   modules/utils.lua              Shared cache-dir/JSON file helpers.
+-- Supporting files:
+--   scripts/torrserver/search-api.lua      JacRed search API client.
+--   scripts/torrserver/torrserver-api.lua  TorrServer's own HTTP API + process management.
+--   scripts/torrserver/torrserver-update.lua  TorrServer release/update management.
+--   modules/native-dialog.lua               Cross-platform .torrent file picker.
+--   modules/platform.lua                    OS and architecture detection.
+--   modules/utils.lua                       Shared cache-dir/JSON/string helpers.
 --
 -- Configuration:
 --   torrserver.conf controls TorrServer, search API, paths, retry/polling
@@ -27,8 +29,10 @@ local utils = require("mp.utils")
 local options = require("mp.options")
 local platform = dofile(mp.command_native({"expand-path", "~~/modules/platform.lua"}))
 local native_dialog = dofile(mp.command_native({"expand-path", "~~/modules/native-dialog.lua"}))
-local updater = dofile(mp.command_native({"expand-path", "~~/modules/torrserver-update.lua"}))
 local shared = dofile(mp.command_native({"expand-path", "~~/modules/utils.lua"}))
+local updater = dofile(mp.command_native({"expand-path", "~~/scripts/torrserver/torrserver-update.lua"}))
+local torrserver_api = dofile(mp.command_native({"expand-path", "~~/scripts/torrserver/torrserver-api.lua"}))
+local search_api = dofile(mp.command_native({"expand-path", "~~/scripts/torrserver/search-api.lua"}))
 
 local unpack = table.unpack or unpack
 local script_name = mp.get_script_name()
@@ -48,7 +52,7 @@ local opts = {
     -- history
     history_limit = 20,
     stats_interval = 3,
-    -- metadata polling (see poll_metadata_async)
+    -- metadata polling (see torrserver.poll_metadata_async)
     metadata_retries = 5,
     metadata_retry_delay = 2,
     -- search polling (see search_torrents); 5s × 2 ≈ 10s total
@@ -117,7 +121,13 @@ local type_filters = {
     {label = "Animated series", value = "multserial", match = {"multserial"}},
 }
 
-local torrserver_pid = nil
+local function quality_label(quality)
+    for _, q in ipairs(quality_filters) do
+        if q.value == quality then return q.label end
+    end
+    return quality and tostring(quality) or nil
+end
+
 local history = {}
 local stats = {}
 local stats_timer = nil
@@ -137,7 +147,7 @@ local last_opened_magnet = nil
 local pending_entry = nil
 local files_back = nil -- "back" | "back_search" while in files menu
 local files_items = nil -- items currently shown in the files menu
-local metadata_poll = nil -- {cancelled, hash} while poll_metadata_async is in flight
+local metadata_poll = nil -- poll handle while torrserver.poll_metadata_async is in flight
 
 --- paths / cache -------------------------------------------------------
 
@@ -164,19 +174,11 @@ end
 
 local trim = platform.trim
 
-local function trim_base_url(url)
-    return (url or ""):gsub("/$", "")
-end
-
--- Cached once: opts.torr_server doesn't change at runtime. request_json still
--- accepts a `base` override (used for opts.search_server) via trim_base_url.
-local torr_server_base = trim_base_url(opts.torr_server)
-
 -- torrserver.conf's search_api is only the fallback for a fresh install (no
 -- saved state yet); once the user switches via "Search API: ... (Click to
 -- switch)" in the menu, that choice is remembered here across restarts.
 local state = load_state()
-local search_api = state.search_api or (opts.search_api == "jackett" and "jackett" or "native")
+local search_api_engine = state.search_api or (opts.search_api == "jackett" and "jackett" or "native")
 
 local function load_history()
     local data = shared.read_json_file(history_path)
@@ -222,248 +224,26 @@ end
 
 load_history()
 
---- TorrServer API ------------------------------------------------------
+--- API clients -----------------------------------------------------------
 
--- TorrServer's own HTTP API (distinct from the JacRed search APIs below).
--- Full reference: https://github.com/YouROK/TorrServer/wiki
---
--- POST /torrents  { action, link, hash, title, poster, data, save_to_db }
---   action  "add" | "get" | "set" | "rem" | "list" | "drop" | "wipe"
---     add   adds a torrent (link = magnet/hash/URL); returns the torrent object
---     list  returns every torrent as a JSON array
---     rem   removes a torrent permanently
---     drop  stops a torrent's downloads without removing it (used before rem,
---           since TorrServer refuses to rem a torrent that's still streaming)
---     get/set/wipe are not used by this script
---   link, hash, title, poster, data, save_to_db are the other request fields;
---   only link (add), hash (rem/drop), and save_to_db (add) are used here.
---
---   Torrent object fields actually read by this script:
---     hash / infohash / id             string  info hash
---     title / Title / name             string  torrent title
---     data                             string  custom JSON, may embed a
---                                               nested TorrServer.Title
---     file_stats / files / filelist    array   files in the torrent
---   File object fields actually read by this script:
---     length / Length                  number  file size in bytes
---     path / name / title              string  file path/name within torrent
---     id / index / num                 number  file index (defaults to 0)
---
--- POST /torrent/upload  (multipart form)
---   file          the .torrent file
---   save_to_db    true/false
---
--- GET /stream/{path}?link={hash}&index={index}&play
---   Streams a single file from an added torrent.
-local torrserver_api = {
-    paths = {
-        torrents = "/torrents",
-        upload = "/torrent/upload",
-        stream = "/stream/",
-    },
-    actions = {
-        list = "list",
-        add = "add",
-        remove = "rem",
-        drop = "drop",
-    },
-    torrent_fields = {
-        hash = {"hash", "infohash", "id"},
-        title = {"title", "Title", "name"},
-        files = {"file_stats", "files", "filelist"},
-    },
-    file_fields = {
-        length = {"length", "Length"},
-        path = {"path", "name", "title"},
-        index = {"id", "index", "num"},
-    },
-}
+local torrserver = torrserver_api.new({
+    torr_server = opts.torr_server,
+    request_timeout = opts.request_timeout,
+    browser_path = opts.browser_path,
+})
+
+local search_client = search_api.new({
+    servers = search_servers,
+    api_key = opts.search_api_key,
+    timeout = search.timeout,
+    retries = search.retries,
+    delay = search.delay,
+    title_max_chars = opts.title_max_chars,
+    elide_titles = opts.elide_titles,
+    quality_label = quality_label,
+})
 
 --- torrent helpers ------------------------------------------------------
-
--- Returns obj[key] for the first key that isn't nil. TorrServer and the two
--- JacRed search APIs (native v1.0, Jackett v2.0) disagree on field-name
--- casing/spelling for the same data, so this is the one place that decides
--- which alias wins.
-local function field(obj, ...)
-    for i = 1, select("#", ...) do
-        local v = obj[(select(i, ...))]
-        if v ~= nil then return v end
-    end
-    return nil
-end
-
-local function torrent_field(torrent, key)
-    return field(torrent, unpack(torrserver_api.torrent_fields[key]))
-end
-
-local function file_field(file, key)
-    return field(file, unpack(torrserver_api.file_fields[key]))
-end
-
-local function utf8_codepoint(s, i)
-    local b1 = s:byte(i)
-    if not b1 then return nil, 0 end
-    if b1 < 0x80 then return b1, 1
-    elseif b1 >= 0xF0 then return b1, 4
-    elseif b1 >= 0xE0 then return b1, 3
-    elseif b1 >= 0xC0 then return b1, 2
-    else return b1, 1 end
-end
-
--- Counts codepoints; with `limit` also stops early and returns the byte
--- prefix cut at that many codepoints (used for both length checks and the
--- hard-cut fallback in elide()).
-local function utf8_len(s, limit)
-    local count, i, len = 0, 1, #s
-    while i <= len do
-        local cp, size = utf8_codepoint(s, i)
-        if not cp then break end
-        count = count + 1
-        if limit and count > limit then return limit, s:sub(1, i - 1) end
-        i = i + size
-    end
-    return count, s
-end
-
--- Truncates to whole words: a word is kept in full once more than half of
--- it already fits within max_chars, otherwise it's dropped entirely.
-local function elide(str, max_chars)
-    if not opts.elide_titles or utf8_len(str) <= max_chars then return str end
-    local parts, len, truncated = {}, 0, false
-    for word in str:gmatch("%S+") do
-        local sep = (#parts > 0) and 1 or 0
-        local wlen = utf8_len(word)
-        if len + sep + wlen <= max_chars then
-            parts[#parts + 1] = word
-            len = len + sep + wlen
-        else
-            local avail = max_chars - len - sep
-            if avail >= wlen / 2 then parts[#parts + 1] = word end
-            truncated = true
-            break
-        end
-    end
-    if #parts == 0 then return select(2, utf8_len(str, max_chars)) .. "…" end
-    return truncated and (table.concat(parts, " ") .. "…") or table.concat(parts, " ")
-end
-
-local function torrent_hash(torrent)
-    return torrent_field(torrent, "hash")
-end
-
-local function torrent_title(torrent)
-    local title = torrent_field(torrent, "title")
-    if title then return title end
-
-    if type(torrent.data) == "string" then
-        local ok, parsed = pcall(utils.parse_json, torrent.data)
-        if ok and type(parsed) == "table" then
-            return field(parsed, "Title") or (parsed.TorrServer and field(parsed.TorrServer, "Title"))
-        end
-    end
-    return nil
-end
-
-local function torrent_files(torrent)
-    local files = torrent_field(torrent, "files")
-    if type(files) == "table" then return files end
-
-    local data = torrent.data
-    if type(data) == "string" then
-        local ok, parsed = pcall(utils.parse_json, data)
-        data = ok and parsed or nil
-    end
-    if type(data) ~= "table" then return {} end
-    if data.TorrServer and type(data.TorrServer.Files) == "table" then
-        return data.TorrServer.Files
-    end
-    return field(data, "Files", "files") or data
-end
-
-local function response_list(response)
-    local list = response and (response.Results or response.torrents or response.data or response)
-    return type(list) == "table" and list or nil
-end
-
-local function find_added_torrent(response, hash)
-    if type(response) == "table" and torrent_hash(response) then
-        return response
-    end
-    local list = response_list(response)
-    if not list then return nil end
-    for _, torrent in pairs(list) do
-        if type(torrent) == "table" and torrent_hash(torrent) == hash then
-            return torrent
-        end
-    end
-    return nil
-end
-
-local function format_size(bytes)
-    bytes = tonumber(bytes) or 0
-    if bytes <= 0 then return "0 B" end
-    local units = {"B", "KB", "MB", "GB", "TB"}
-    local i = 1
-    while bytes >= 1024 and i < #units do
-        bytes = bytes / 1024
-        i = i + 1
-    end
-    return string.format(i == 1 and "%d %s" or "%.2f %s", bytes, units[i])
-end
-
-local function format_speed(bytes_per_sec)
-    bytes_per_sec = tonumber(bytes_per_sec) or 0
-    if bytes_per_sec <= 0 then return "--" end
-    return format_size(bytes_per_sec) .. "/s"
-end
-
-local function torrent_stat_hint(torrent)
-    local size = torrent.torrent_size or torrent.TorrentSize
-    if not size then return nil end
-    local speed = torrent.download_speed or torrent.DownloadSpeed
-    local peers = torrent.active_peers or torrent.ActivePeers or 0
-    local seeds = torrent.connected_seeders or torrent.ConnectedSeeders or 0
-    return format_size(size) .. " · " .. format_speed(speed) .. " · " .. peers .. "/" .. seeds
-end
-
-local function encode_path(path)
-    local encoded = {}
-    for part in path:gmatch("[^/]+") do
-        encoded[#encoded + 1] = part:gsub("([^%w%._%-~])", function(char)
-            return string.format("%%%02X", char:byte())
-        end)
-    end
-    return table.concat(encoded, "/")
-end
-
-local function file_title(file)
-    return file_field(file, "path") or ("File " .. tostring(file_field(file, "index") or "?"))
-end
-
-local function stream_url(file, hash)
-    local index = file_field(file, "index") or 0
-    return torr_server_base .. torrserver_api.paths.stream .. encode_path(file_title(file))
-        .. "?link=" .. hash .. "&index=" .. tostring(index) .. "&play"
-end
-
-local function file_items(torrent)
-    local hash = torrent_hash(torrent)
-    local items = {}
-    for _, file in pairs(torrent_files(torrent)) do
-        if type(file) == "table" then
-            local size = tonumber(file_field(file, "length"))
-            items[#items + 1] = {
-                title = file_title(file),
-                hint = size and size > 0 and format_size(size) or nil,
-                icon = "movie",
-                value = {"loadfile", stream_url(file, hash), "replace"},
-            }
-        end
-    end
-    table.sort(items, function(a, b) return a.title < b.title end)
-    return items
-end
 
 local function is_magnet(value)
     return type(value) == "string" and value:match("^magnet:%?") ~= nil
@@ -472,6 +252,10 @@ end
 local function magnet_hash(magnet)
     local hash = magnet:match("[?&]xt=urn:btih:([^&]+)")
     return hash and hash:lower()
+end
+
+local function elide(str, max_chars)
+    return shared.elide(str, max_chars, opts.elide_titles)
 end
 
 --- process management ---------------------------------------------------
@@ -490,39 +274,15 @@ local function resolved_bin_path()
 end
 
 local function start_torrserver(silent)
-    if torrserver_pid then return true end
-
-    local bin_path = resolved_bin_path()
-    if not utils.file_info(bin_path) then
-        if not silent then
-            show_error("TorrServer not found at: " .. bin_path)
-        end
-        return false
+    local ok, error_text = torrserver.start(resolved_bin_path())
+    if not ok and not silent then
+        show_error(error_text)
     end
-
-    local ps_cmd = string.format(
-        'Start-Process -FilePath "%s" -WindowStyle Hidden -PassThru | Select-Object -ExpandProperty Id',
-        bin_path
-    )
-    local result = platform.run_subprocess({"powershell.exe", "-NoProfile", "-Command", ps_cmd})
-
-    if result and result.status == 0 and result.stdout then
-        torrserver_pid = tonumber(result.stdout:match("%d+"))
-        if torrserver_pid then
-            mp.msg.info("TorrServer started (PID: " .. torrserver_pid .. ")")
-            return true
-        end
-    end
-
-    show_error("Failed to start TorrServer: " .. (result and result.stderr or "unknown error"))
-    return false
+    return ok
 end
 
 local function stop_torrserver()
-    if not torrserver_pid then return end
-    platform.run_subprocess({"taskkill.exe", "/PID", tostring(torrserver_pid), "/T", "/F"})
-    mp.msg.info("TorrServer stopped (PID: " .. torrserver_pid .. ")")
-    torrserver_pid = nil
+    torrserver.stop()
 end
 
 local function open_url(url)
@@ -530,7 +290,7 @@ local function open_url(url)
 end
 
 local function open_torrserver_ui()
-    open_url(opts.torr_server)
+    torrserver.open_ui()
 end
 
 -- "Open source" pauses playback instead of touching the stream, so leaving
@@ -539,77 +299,6 @@ local function pause_if_playing(hash)
     if hash and playing.hash and hash:lower() == playing.hash then
         mp.set_property_bool("pause", true)
     end
-end
-
-local function run_curl(args)
-    local result = platform.run_subprocess(args)
-    if not result or result.status ~= 0 then
-        return nil, result and (result.stderr or result.error_string) or "no response"
-    end
-    return result.stdout or "", nil
-end
-
--- Calls attempt() up to `retries` times, pausing `delay` seconds between
--- tries. Before each try, render(attempt, retries) can show progress.
--- Stops as soon as attempt() returns true; attempt() reports its result
--- through the caller's own variables, not a return value.
-local function with_retries(retries, delay, render, attempt)
-    for i = 1, retries do
-        render(i, retries)
-        if attempt() then return true end
-        if i < retries then platform.sleep(delay) end
-    end
-    return false
-end
-
-local function torr_server_request_args(method, path, body, timeout, retries, base)
-    local args = {
-        "curl", "--silent", "--show-error", "--fail", "--ssl-revoke-best-effort",
-        "--max-time", tostring(timeout or opts.request_timeout),
-        -- TorrServer's HTTP socket isn't open the instant the process starts.
-        "--retry", tostring(retries or 5), "--retry-delay", "1", "--retry-connrefused",
-    }
-    if method == "POST" then
-        args[#args + 1] = "-X"
-        args[#args + 1] = "POST"
-        args[#args + 1] = "-H"
-        args[#args + 1] = "Content-Type: application/json"
-        args[#args + 1] = "--data-binary"
-        args[#args + 1] = utils.format_json(body)
-    end
-    args[#args + 1] = (base and trim_base_url(base) or torr_server_base) .. path
-    return args
-end
-
-local function request_json(method, path, body, timeout, retries, base)
-    local args = torr_server_request_args(method, path, body, timeout, retries, base)
-    local output, error_text = run_curl(args)
-    if not output then return nil, error_text end
-    if output == "" then return true, nil end
-    local ok, data = pcall(utils.parse_json, output)
-    if not ok or not data then return nil, "invalid JSON response" end
-    return data, nil
-end
-
-local function curl_form_path(path)
-    local escaped = path:gsub("\\", "\\\\"):gsub('"', '\\"')
-    return '"' .. escaped .. '"'
-end
-
-local function request_upload(filepath)
-    local args = {
-        "curl", "--silent", "--show-error", "--fail",
-        "--max-time", tostring(opts.request_timeout),
-        "--retry", "5", "--retry-delay", "1", "--retry-connrefused",
-        "-F", "file=@" .. curl_form_path(filepath),
-        "-F", "save_to_db=true",
-        torr_server_base .. torrserver_api.paths.upload,
-    }
-    local output, error_text = run_curl(args)
-    if not output then return nil, error_text end
-    local ok, data = pcall(utils.parse_json, output)
-    if not ok or not data then return nil, "invalid JSON response" end
-    return data, nil
 end
 
 local function read_clipboard()
@@ -757,162 +446,6 @@ local function show_files(items, back)
 end
 
 --- search -----------------------------------------------------------
-
--- JacRed search API field maps. Only mapped keys are read by api_field /
--- normalize_search_item; the comment blocks list every property observed in
--- real responses so unused fields are visible when extending.
---
--- Field aliases are ordered: preferred key first, then fallbacks.
-local search_api_fields = {
-    -- Native v1.0  GET /api/v1.0/torrents?search=...&apikey=...
-    -- Response: JSON array of objects (empty object {} when no results).
-    --   tracker      string    tracker slug (e.g. "korsars", "rutor", "bitru")
-    --   url          string    details page URL
-    --   title        string    full release title
-    --   size         number    size in bytes
-    --   sizeName     string    human-readable size (e.g. "11.9 GB")
-    --   createTime   string    ISO timestamp first seen
-    --   updateTime   string    ISO timestamp last updated
-    --   sid          number    seeders
-    --   pir          number    peers/leechers
-    --   magnet       string    magnet URI
-    --   name         string    normalized title (localized)
-    --   originalname string    original (usually English) title
-    --   released     number    release year
-    --   videotype    string    "sdr" | "hdr" | ...
-    --   quality      number    resolution: 480, 720, 1080, 2160
-    --   voices       string[]  dubbing/voice tags (e.g. "Дубляж", studio names)
-    --   seasons      number[]  season numbers (empty for movies)
-    --   types        string[]  content tags: "movie", "serial", "tvshow",
-    --                          "documovie", "docuserial", "anime", "ova", "ona",
-    --                          "multfilm", "multserial"
-    -- Not present on v1.0: languages, ffprobe, Category, nested info.
-    native = {
-        list = nil, -- direct array
-        tracker   = {"tracker"},
-        url       = {"url"},
-        title     = {"title"},
-        size      = {"size"},
-        seeders   = {"sid"},
-        peers     = {"pir"},
-        magnet    = {"magnet"},
-        quality   = {"quality"},
-        videotype = {"videotype"},
-        types     = {"types"},
-        released  = {"relased", "released"},
-        languages = nil, -- not present on v1.0
-        voices    = {"voices"},
-    },
-    -- Jackett v2.0  GET /api/v2.0/indexers/all/results?query=...&apikey=...
-    -- Response: { Results = [ ... ], Error = null|string }.
-    --   Tracker      string    tracker slug(s), comma-separated when merged
-    --   Details      string    details page URL (primary)
-    --   Title        string    full release title
-    --   Size         number    size in bytes
-    --   PublishDate  string    ISO publication timestamp
-    --   Category     number[]  Jackett category IDs (2000=Movies, 5000=TV, ...)
-    --   CategoryDesc string    human-readable category
-    --   Seeders      number    seeders
-    --   Peers        number    peers/leechers
-    --   MagnetUri    string    magnet URI
-    --   ffprobe      object[]  optional media stream metadata (codec, width,
-    --                          height, language, bit_rate, tags, ...)
-    --   languages    string[]  audio/subtitle language codes (e.g. "rus", "eng")
-    --   info         object    enriched JacRed metadata (may be absent):
-    --     info.quality      number    resolution: 480, 720, 1080, 2160
-    --     info.videotype    string    "sdr" | "hdr" | ...
-    --     info.voices       string[]  dubbing/voice tags
-    --     info.types        string[]  content tags (same set as native)
-    --     info.released     number    release year (API typo; 0 when unknown)
-    --     info.name         string    normalized title (localized)
-    --     info.originalname string    original title
-    --     info.sizeName     string    human-readable size
-    --     info.seasons      number[]  season numbers
-    -- Occasional aliases seen in the wild: Link (url), Magnet (magnet),
-    -- quality/videotype/types/released/voices at top level when info is missing.
-    jackett = {
-        list      = "Results",
-        tracker   = {"Tracker"},
-        url       = {"Details"},
-        title     = {"Title"},
-        size      = {"Size"},
-        seeders   = {"Seeders"},
-        peers     = {"Peers"},
-        magnet    = {"MagnetUri"},
-        quality   = {"info.quality"},
-        videotype = {"info.videotype"},
-        types     = {"info.types"},
-        released  = {"info.relased", "info.released"},
-        languages = {"languages"},
-        voices    = {"info.voices"},
-    },
-}
-
-local function field_path(obj, path)
-    local cur = obj
-    for part in path:gmatch("[^%.]+") do
-        if type(cur) ~= "table" then return nil end
-        cur = cur[part]
-        if cur == nil then return nil end
-    end
-    return cur
-end
-
--- Prefer the active API map, fall back to the other so mixed responses still work.
-local function api_field(item, key)
-    local primary = search_api == "jackett" and search_api_fields.jackett or search_api_fields.native
-    local secondary = search_api == "jackett" and search_api_fields.native or search_api_fields.jackett
-    for _, map in ipairs({primary, secondary}) do
-        local aliases = map[key]
-        if type(aliases) == "table" then
-            for _, alias in ipairs(aliases) do
-                local v = alias:find("%.") and field_path(item, alias) or item[alias]
-                if v ~= nil then return v end
-            end
-        end
-    end
-    return nil
-end
-
--- Tracker string may list several trackers for one release, comma-separated
--- (e.g. "rutracker, torrentby, bitru, rutor"); Details links to the first.
-local function raw_tracker(item)
-    if type(item) == "string" then return item end
-    return api_field(item, "tracker")
-end
-
-local function first_tracker(item)
-    local tracker = raw_tracker(item)
-    return tracker and tracker:match("^%s*([^,]+)")
-end
-
-local function tracker_count(item)
-    local tracker = raw_tracker(item)
-    if not tracker then return 0 end
-    local _, commas = tracker:gsub(",", "")
-    return commas + 1
-end
-
--- Everything in item.Tracker after the first one (which Details already
--- points to) — shown on hover so the rest of the list isn't just "+N".
-local function other_trackers(item)
-    local tracker = raw_tracker(item)
-    if not tracker then return nil end
-    local rest, first = {}, true
-    for name in tracker:gmatch("[^,]+") do
-        if first then
-            first = false
-        else
-            rest[#rest + 1] = name:match("^%s*(.-)%s*$")
-        end
-    end
-    return #rest > 0 and table.concat(rest, ", ") or nil
-end
-
-local function search_source_url(item)
-    local url = api_field(item, "url")
-    return url and url:match("^https?://") and url or nil
-end
 
 local function list_has(list, value)
     if not list or value == nil then return false end
@@ -1154,7 +687,7 @@ local function filters_label()
 end
 
 local function search_api_label()
-    return search_api == "native" and "Native" or "Jackett"
+    return search_api_engine == "native" and "Native" or "Jackett"
 end
 
 -- Forward-declared: cycle_sort (below) needs to call these, but they're
@@ -1333,98 +866,6 @@ local function try_toggle_prefixed_filter(value)
     return false
 end
 
-local function quality_label(quality)
-    for _, q in ipairs(quality_filters) do
-        if q.value == quality then return q.label end
-    end
-    return quality and tostring(quality) or nil
-end
-
-local function search_hint(normalized)
-    local parts = {}
-    local tracker = first_tracker(normalized.tracker)
-    if tracker then
-        local count = tracker_count(normalized.tracker)
-        parts[#parts + 1] = count > 1 and (tracker .. " +" .. (count - 1)) or tracker
-    end
-    local q = quality_label(normalized.quality)
-    if q then parts[#parts + 1] = q end
-    if normalized.size and normalized.size > 0 then
-        parts[#parts + 1] = format_size(normalized.size)
-    end
-    parts[#parts + 1] = "S:" .. tostring(normalized.seeders or 0)
-        .. " P:" .. tostring(normalized.peers or 0)
-    return table.concat(parts, " · ")
-end
-
--- Normalize one raw API item into the internal shape used by filters, sort,
--- and the menu. All API-specific field names stay in search_api_fields / api_field.
-local function normalize_search_item(item)
-    local magnet = api_field(item, "magnet")
-    if not magnet then return nil end
-
-    local tracker = api_field(item, "tracker")
-    local title = api_field(item, "title")
-    local size = tonumber(api_field(item, "size")) or 0
-    local seeders = tonumber(api_field(item, "seeders")) or 0
-    local peers = tonumber(api_field(item, "peers")) or 0
-    local quality = tonumber(api_field(item, "quality"))
-    local videotype = api_field(item, "videotype")
-    local types = api_field(item, "types")
-    local released = tonumber(api_field(item, "released"))
-    local languages = api_field(item, "languages")
-    local voices = api_field(item, "voices")
-    local url = search_source_url(item)
-
-    local actions = {{name = "copy_magnet", icon = "content_copy", label = "Copy magnet link"}}
-    if url then
-        local label = "Open on " .. (first_tracker(tracker) or "site")
-        local others = other_trackers(tracker)
-        if others then label = label .. " (also on: " .. others .. ")" end
-        table.insert(actions, 1, {name = "open_source", icon = "open_in_new", label = label})
-    end
-
-    return {
-        title = elide(title or "Untitled", opts.title_max_chars),
-        hint = search_hint({
-            tracker = tracker,
-            quality = quality,
-            size = size,
-            seeders = seeders,
-            peers = peers,
-        }),
-        icon = "movie",
-        value = magnet,
-        keep_open = true,
-        actions = actions,
-        size = size,
-        seeders = seeders,
-        peers = peers,
-        quality = quality,
-        videotype = videotype and tostring(videotype):lower() or nil,
-        types = types,
-        released = released,
-        languages = languages,
-        voices = voices,
-        source_url = url,
-    }
-end
-
-local function build_search_items(response)
-    local items, urls = {}, {}
-    for _, item in ipairs(response_list(response) or {}) do
-        local normalized = normalize_search_item(item)
-        if normalized then
-            if normalized.source_url then
-                urls[normalized.value] = normalized.source_url
-            end
-            normalized.source_url = nil
-            items[#items + 1] = normalized
-        end
-    end
-    return items, urls
-end
-
 -- Re-renders search results against the current filter state (text + size + seeds).
 function render_search_menu(preserve_filter)
     files_back = nil
@@ -1458,30 +899,12 @@ local function search_torrents(query)
     if not start_torrserver() then return end
 
     menu_view = "search"
-    local path
-    if search_api == "native" then
-        path = "/api/v1.0/torrents?apikey=" .. opts.search_api_key
-            .. "&search=" .. encode_path(query)
-    else
-        path = "/api/v2.0/indexers/all/results?apikey=" .. opts.search_api_key
-            .. "&t=search&q=" .. encode_path(query)
-    end
-    local response, error_text, items, urls
-    with_retries(search.retries, search.delay,
-        function(attempt, total)
-            local label = "Searching..."
-            if total > 1 then label = label .. " (" .. attempt .. "/" .. total .. ")" end
-            send_menu("update-menu", search_menu({{title = label, icon = "spinner", selectable = false}}))
-        end,
-        function()
-            for _, server in ipairs(search_servers) do
-                response, error_text = request_json("GET", path, nil, search.timeout, 1, server)
-                items, urls = build_search_items(response)
-                if #items > 0 then return true end
-            end
-            return false
-        end)
-    if not response or not items or #items == 0 then
+    local items, urls, error_text = search_client.search(search_api_engine, query, function(attempt, total)
+        local label = "Searching..."
+        if total > 1 then label = label .. " (" .. attempt .. "/" .. total .. ")" end
+        send_menu("update-menu", search_menu({{title = label, icon = "spinner", selectable = false}}))
+    end)
+    if #items == 0 then
         show_error(error_text or "search failed")
         render_search_menu()
         return
@@ -1492,54 +915,6 @@ local function search_torrents(query)
 end
 
 --- flows ------------------------------------------------------------
-
--- Async metadata poll: retries up to `retries` times, `delay` seconds apart,
--- using a timer + non-blocking subprocess (unlike with_retries) so the menu
--- stays responsive and the wait can be cancelled (see cancel_pending_add)
--- instead of blocking mpv while retrying. on_progress(attempt, total) fires
--- before each try; on_done(torrent, items, error_text) fires once, or never
--- if cancelled first.
-local function poll_metadata_async(hash, retries, delay, back, on_progress, on_done)
-    local poll = {cancelled = false, hash = hash, back = back}
-    metadata_poll = poll
-    local attempt = 0
-
-    local function step()
-        if poll.cancelled then return end
-        attempt = attempt + 1
-        on_progress(attempt, retries)
-        local args = torr_server_request_args("POST", torrserver_api.paths.torrents, {action = torrserver_api.actions.list})
-        platform.run_subprocess_async(args, function(success, result, err)
-            if poll.cancelled then return end
-            local torrent, items, error_text
-            if success and result and result.status == 0 then
-                local ok, list_response = pcall(utils.parse_json, result.stdout or "")
-                if ok and list_response then
-                    torrent = find_added_torrent(list_response, hash)
-                    if not torrent and not hash and type(list_response[1]) == "table" then
-                        torrent = list_response[1]
-                    end
-                    items = torrent and file_items(torrent) or {}
-                else
-                    error_text = "invalid JSON response"
-                end
-            else
-                error_text = result and (result.stderr or result.error_string) or (err and tostring(err)) or "no response"
-            end
-
-            if items and #items > 0 then
-                metadata_poll = nil
-                on_done(torrent, items, nil)
-            elseif attempt >= retries then
-                metadata_poll = nil
-                on_done(torrent, items or {}, error_text)
-            else
-                mp.add_timeout(delay, step)
-            end
-        end)
-    end
-    step()
-end
 
 local function begin_add(back)
     if not start_torrserver() then return false end
@@ -1582,22 +957,22 @@ local function finish_add(response, error_text, hash, fallback_title, source, ba
             -- Torrent was already added to TorrServer (save_to_db=true); with no
             -- files to show there's nothing pending to discard it later, so it
             -- would otherwise sit there orphaned. Clean it up now instead.
-            local orphan_hash = (torrent and torrent_hash(torrent)) or hash
+            local orphan_hash = (torrent and torrserver_api.torrent_hash(torrent)) or hash
             if orphan_hash then remove_torrent(orphan_hash) end
             show_error(poll_error or "no files found")
             back_to_previous(back)
             return
         end
-        local title = torrent_title(torrent) or fallback_title
-        pending_entry = {hash = torrent_hash(torrent) or hash, title = title, items = items, source = source}
+        local title = torrserver_api.torrent_title(torrent) or fallback_title
+        pending_entry = {hash = torrserver_api.torrent_hash(torrent) or hash, title = title, items = items, source = source}
         show_files(items, back)
     end
 
-    local torrent = find_added_torrent(response, hash)
+    local torrent = torrserver_api.find_added_torrent(response, hash)
     if not torrent and not hash and type(response[1]) == "table" then
         torrent = response[1]
     end
-    local items = torrent and file_items(torrent) or {}
+    local items = torrent and torrserver.file_items(torrent) or {}
     if #items > 0 then
         complete(torrent, items)
         return
@@ -1605,12 +980,16 @@ local function finish_add(response, error_text, hash, fallback_title, source, ba
 
     -- Metadata (file list) can take a few seconds to arrive after adding, so
     -- poll for it; cancel_pending_add() can abort this while it's running.
-    poll_metadata_async(hash, metadata.retries, metadata.delay, back, function(attempt, total)
+    metadata_poll = torrserver.poll_metadata_async(hash, metadata.retries, metadata.delay, function(attempt, total)
         send_menu("update-menu", menu_data("Add torrent", {
             back_item(back),
             {title = "Waiting for metadata (" .. attempt .. "/" .. total .. ")...", icon = "spinner", selectable = false},
         }))
-    end, complete)
+    end, function(torrent, items, poll_error)
+        metadata_poll = nil
+        complete(torrent, items, poll_error)
+    end)
+    metadata_poll.back = back
 end
 
 local function add_magnet(magnet, source, back)
@@ -1621,11 +1000,7 @@ local function add_magnet(magnet, source, back)
     if not begin_add(back) then return end
 
     local hash = magnet_hash(magnet)
-    local response, error_text = request_json("POST", torrserver_api.paths.torrents, {
-        action = torrserver_api.actions.add,
-        link = magnet,
-        save_to_db = true,
-    })
+    local response, error_text = torrserver.add(magnet)
     finish_add(response, error_text, hash, "Untitled torrent", source, back)
 end
 
@@ -1641,8 +1016,8 @@ local stats_refresh_in_flight = false
 local function apply_stats_response(list_response)
     local changed = false
     for _, entry in ipairs(history) do
-        local torrent = find_added_torrent(list_response, entry.hash)
-        local hint = torrent and torrent_stat_hint(torrent) or nil
+        local torrent = torrserver_api.find_added_torrent(list_response, entry.hash)
+        local hint = torrent and torrserver_api.torrent_stat_hint(torrent) or nil
         if hint ~= stats[entry.hash] then
             changed = true
         end
@@ -1664,12 +1039,9 @@ local function refresh_stats()
     if menu_view ~= "root" then return end
     if stats_refresh_in_flight then return end
     stats_refresh_in_flight = true
-    local args = torr_server_request_args("POST", torrserver_api.paths.torrents, {action = torrserver_api.actions.list})
-    platform.run_subprocess_async(args, function(success, result, err)
+    torrserver.list(function(list_response)
         stats_refresh_in_flight = false
-        if not success or not result or result.status ~= 0 then return end
-        local ok, list_response = pcall(utils.parse_json, result.stdout or "")
-        if not ok or not list_response then return end
+        if not list_response then return end
         apply_stats_response(list_response)
     end)
 end
@@ -1725,16 +1097,6 @@ function return_to_root()
     show_root_menu("update-menu")
 end
 
-local function torrent_action(action, hash, error_prefix)
-    if not start_torrserver() then return false end
-    local _, error_text = request_json("POST", torrserver_api.paths.torrents, {action = action, hash = hash})
-    if error_text then
-        show_error(error_prefix .. ": " .. error_text)
-        return false
-    end
-    return true
-end
-
 local function stop_if_playing(hash)
     if hash and playing.hash and hash:lower() == playing.hash then
         mp.commandv("stop")
@@ -1742,16 +1104,22 @@ local function stop_if_playing(hash)
 end
 
 local function drop_torrent(hash)
-    local ok = torrent_action(torrserver_api.actions.drop, hash, "could not stop torrent")
-    if ok then stop_if_playing(hash) end
+    local ok, error_text = torrserver.drop(hash)
+    if not ok then
+        show_error("could not stop torrent: " .. (error_text or ""))
+    else
+        stop_if_playing(hash)
+    end
     return ok
 end
 
--- TorrServer refuses to "rem" a torrent that's still actively streaming, so
--- drop it first to release the reader.
 function remove_torrent(hash)
     drop_torrent(hash)
-    return torrent_action(torrserver_api.actions.remove, hash, "could not remove torrent from TorrServer")
+    local ok, error_text = torrserver.remove(hash)
+    if not ok then
+        show_error("could not remove torrent from TorrServer: " .. (error_text or ""))
+    end
+    return ok
 end
 
 -- Leaving the file list without playing anything means the user didn't want
@@ -1764,8 +1132,8 @@ local function discard_pending()
 end
 
 -- Undoes an add that hasn't been committed to history yet, whichever stage
--- it's at: an in-flight metadata poll (see poll_metadata_async) or an
--- already-resolved pending_entry. Returns the poll's back target, if any,
+-- it's at: an in-flight metadata poll (see torrserver.poll_metadata_async) or
+-- an already-resolved pending_entry. Returns the poll's back target, if any,
 -- so callers don't need to inspect metadata_poll themselves.
 local function cancel_pending_add()
     local back
@@ -1823,7 +1191,7 @@ local function add_torrent_from_file(filepath)
     if not begin_add() then return end
 
     local _, filename = utils.split_path(filepath)
-    local response, error_text = request_upload(filepath)
+    local response, error_text = torrserver.request_upload(filepath)
     finish_add(response, error_text, nil, filename)
 end
 
@@ -2038,8 +1406,8 @@ mp.register_script_message("torrserver-menu-event", function(json)
         end
     elseif event.value == "toggle_search_api" then
         if not last_search or last_search.query == "" then return end
-        search_api = search_api == "native" and "jackett" or "native"
-        state.search_api = search_api
+        search_api_engine = search_api_engine == "native" and "jackett" or "native"
+        state.search_api = search_api_engine
         save_state(state)
         search_torrents(last_search.query)
     elseif event.value == "cycle_sort" then
