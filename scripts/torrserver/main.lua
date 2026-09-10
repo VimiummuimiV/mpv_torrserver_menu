@@ -1077,8 +1077,6 @@ end
 
 -- Kicks off a stats refresh (now async, see refresh_stats) so the root menu's
 -- seeds/speed/history update shortly after it opens, then keeps polling.
--- check_for_update() is passive and TTL-cached (see opts.update_check_interval)
--- so repeatedly returning to the root menu doesn't hit the release API every time.
 local function show_root_menu(command)
     if start_torrserver(true) then refresh_stats() end
     files_back = nil
@@ -1088,7 +1086,6 @@ local function show_root_menu(command)
     if not stats_timer then
         stats_timer = mp.add_periodic_timer(opts.stats_interval, refresh_stats)
     end
-    mp.add_timeout(0.05, check_for_update)
 end
 
 -- Leaving search back to the root menu drops the active filter, so
@@ -1474,3 +1471,7 @@ mp.add_key_binding(nil, "torrserver", function()
 end)
 
 mp.register_event("shutdown", stop_torrserver)
+
+-- Runs once per mpv start/script reload; TTL-cached (see opts.update_check_interval)
+-- so this only hits the binary/release API once a day, never on menu open.
+mp.add_timeout(0.05, check_for_update)
