@@ -1056,39 +1056,23 @@ local function refresh_stats()
     end)
 end
 
--- Installed-binary version doesn't change mid-session (except right after
--- finalize_update, which refreshes this itself), so it's only worth spawning
--- the binary for --version once per mpv session instead of on every menu open.
-local installed_version_known, installed_version_cache = false, nil
-
-local function apply_update_check(installed, release)
-    if not release then return end
-    if not installed or installed ~= release.version then
-        local prev = available_update
-        if not prev or prev.latest ~= release.version or prev.installed ~= installed then
-            available_update = {installed = installed, latest = release.version}
+-- Fully asynchronous, and gated end-to-end by the on-disk cache: within
+-- update_check_interval (a day, by default) this is a plain file read with
+-- no subprocess spawn and no network call at all.
+local function check_for_update()
+    updater.cached_update_status_async(native_dialog.platform, resolved_bin_path(), update_cache_path, opts.update_check_interval, function(installed, release)
+        if not release then return end
+        if not installed or installed ~= release.version then
+            local prev = available_update
+            if not prev or prev.latest ~= release.version or prev.installed ~= installed then
+                available_update = {installed = installed, latest = release.version}
+                if menu_view == "root" then send_menu("update-menu", root_menu()) end
+            end
+        elseif available_update then
+            available_update = nil
             if menu_view == "root" then send_menu("update-menu", root_menu()) end
         end
-    elseif available_update then
-        available_update = nil
-        if menu_view == "root" then send_menu("update-menu", root_menu()) end
-    end
-end
-
--- Fully asynchronous: neither the installed-version lookup nor the (at most
--- once-a-day) release check are allowed to block mpv while the menu opens.
-local function check_for_update()
-    local function with_installed(installed)
-        installed_version_known, installed_version_cache = true, installed
-        updater.cached_latest_release_async(native_dialog.platform, update_cache_path, opts.update_check_interval, function(release)
-            apply_update_check(installed, release)
-        end)
-    end
-    if installed_version_known then
-        with_installed(installed_version_cache)
-    else
-        updater.installed_version_async(resolved_bin_path(), with_installed)
-    end
+    end)
 end
 
 -- Kicks off a stats refresh (now async, see refresh_stats) so the root menu's
@@ -1246,7 +1230,9 @@ local function finalize_update(bin_path, tmp_path, installed, version)
     end
 
     available_update = nil
-    installed_version_known, installed_version_cache = true, version
+    -- Keeps today's remaining passive checks (see check_for_update) from
+    -- re-detecting the version we just installed as an available update.
+    shared.write_json_file(update_cache_path, {checked_at = os.time(), installed = version, release = {version = version}}, true)
     start_torrserver()
     mp.osd_message("TorrServer " .. (installed and "updated to" or "installed:") .. " " .. version, 3)
     send_menu("update-menu", root_menu())

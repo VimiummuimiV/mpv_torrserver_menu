@@ -163,30 +163,34 @@ local function latest_release_async(platform, on_done)
     end)
 end
 
--- Wraps latest_release_async() with an on-disk TTL cache, so callers that
--- check passively/repeatedly (e.g. every time a menu returns to its root)
--- don't hit the release API on every single call, and never block mpv while
--- doing so. Falls back to a stale cached entry if the network call fails, so
--- a temporary outage doesn't erase the last known result.
-local function cached_latest_release_async(platform, cache_path, ttl_seconds, on_done)
+-- Wraps installed_version_async() + latest_release_async() with an on-disk
+-- TTL cache, so passive/repeated callers (e.g. every time the menu opens)
+-- neither spawn the binary nor hit the release API more than once per
+-- ttl_seconds window — a cache hit is a plain file read, nothing else.
+-- on_done(installed_or_nil, release_or_nil). Falls back to a stale cached
+-- release if the network call fails, so a temporary outage doesn't erase the
+-- last known result.
+local function cached_update_status_async(platform, bin_path, cache_path, ttl_seconds, on_done)
     local cached = shared.read_json_file(cache_path)
     local now = os.time()
     if cached and cached.checked_at and cached.release and (now - cached.checked_at) < (ttl_seconds or 86400) then
-        on_done(cached.release, nil)
+        on_done(cached.installed, cached.release)
         return
     end
 
-    latest_release_async(platform, function(release, err)
-        if release then
-            shared.write_json_file(cache_path, {checked_at = now, release = release}, true)
-            on_done(release, nil)
-            return
-        end
-        if cached and cached.release then
-            on_done(cached.release, nil)
-            return
-        end
-        on_done(nil, err)
+    installed_version_async(bin_path, function(installed)
+        latest_release_async(platform, function(release, err)
+            if release then
+                shared.write_json_file(cache_path, {checked_at = now, installed = installed, release = release}, true)
+                on_done(installed, release)
+                return
+            end
+            if cached and cached.release then
+                on_done(installed, cached.release)
+                return
+            end
+            on_done(installed, nil)
+        end)
     end)
 end
 
@@ -268,7 +272,7 @@ return {
     installed_version_async = installed_version_async,
     latest_release = latest_release,
     latest_release_async = latest_release_async,
-    cached_latest_release_async = cached_latest_release_async,
+    cached_update_status_async = cached_update_status_async,
     download_async = download_async,
     replace_binary = replace_binary,
     default_bin_name = default_bin_name,
