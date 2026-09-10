@@ -1,4 +1,4 @@
-# mpv-torrserver-menu
+# uosc-torrserver-menu
 
 ![Demo](assets/demo.gif)
 
