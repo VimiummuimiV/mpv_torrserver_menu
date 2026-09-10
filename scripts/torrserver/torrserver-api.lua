@@ -238,28 +238,35 @@ function M.new(opts)
     end
 
     -- Starts the local TorrServer process if it isn't already running.
-    -- Returns true/false, error_message (error_message is nil when already running).
+    -- Returns true/false, error_message (error_message is nil when already
+    -- running/starting). The actual launch is fired off asynchronously since
+    -- callers' HTTP requests already retry through --retry-connrefused, so
+    -- nothing needs to block waiting for the process to come up.
+    local starting = false
+
     function api.start(bin_path)
-        if pid then return true end
+        if pid or starting then return true end
         if not utils.file_info(bin_path) then
             return false, "TorrServer not found at: " .. bin_path
         end
+        starting = true
 
         local ps_cmd = string.format(
             'Start-Process -FilePath "%s" -WindowStyle Hidden -PassThru | Select-Object -ExpandProperty Id',
             bin_path
         )
-        local result = platform.run_subprocess({"powershell.exe", "-NoProfile", "-Command", ps_cmd})
-
-        if result and result.status == 0 and result.stdout then
-            pid = tonumber(result.stdout:match("%d+"))
-            if pid then
-                mp.msg.info("TorrServer started (PID: " .. pid .. ")")
-                return true
+        platform.run_subprocess_async({"powershell.exe", "-NoProfile", "-Command", ps_cmd}, function(success, result)
+            starting = false
+            if success and result and result.status == 0 and result.stdout then
+                pid = tonumber(result.stdout:match("%d+"))
+                if pid then
+                    mp.msg.info("TorrServer started (PID: " .. pid .. ")")
+                    return
+                end
             end
-        end
-
-        return false, "Failed to start TorrServer: " .. (result and result.stderr or "unknown error")
+            mp.msg.error("Failed to start TorrServer: " .. (result and result.stderr or "unknown error"))
+        end)
+        return true
     end
 
     function api.stop()
