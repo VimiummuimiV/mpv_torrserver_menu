@@ -17,6 +17,17 @@ local function run_command(args)
     return result.stdout or "", nil
 end
 
+-- Non-blocking counterpart of run_command; on_done(output, error_text).
+local function run_command_async(args, on_done)
+    platform.run_subprocess_async(args, function(success, result, err)
+        if not success or not result or result.status ~= 0 then
+            on_done(nil, result and (result.stderr or result.error_string) or (err and tostring(err)) or "no response")
+        else
+            on_done(result.stdout or "", nil)
+        end
+    end)
+end
+
 local function curl_base_args()
     local args = {
         "curl", "--silent", "--show-error", "--fail", "--ssl-revoke-best-effort",
@@ -42,30 +53,34 @@ local function default_bin_name(platform)
     return platform == "windows" and "TorrServer.exe" or "TorrServer"
 end
 
-local function installed_version(bin_path)
-    if not bin_path or bin_path == "" then
-        return nil
-    end
-    if not utils.file_info(bin_path) then
-        return nil
-    end
-
-    local output = run_command({bin_path, "--version"})
-    if not output then
-        return nil
-    end
-
+-- Shared by installed_version and installed_version_async: pulls the version
+-- string out of `bin_path --version` output.
+local function parse_installed_version(output)
+    if not output then return nil end
     local version = output:match("MatriX%.[%w%.%-]+")
-    if version then
-        return version
-    end
-
+    if version then return version end
     version = output:match("([%w%.%-]+)%s*$")
-    if version and version ~= "" then
-        return version
-    end
-
+    if version and version ~= "" then return version end
     return nil
+end
+
+local function installed_version(bin_path)
+    if not bin_path or bin_path == "" or not utils.file_info(bin_path) then
+        return nil
+    end
+    return parse_installed_version(run_command({bin_path, "--version"}))
+end
+
+-- Non-blocking counterpart; on_done(version_or_nil). Used for the passive,
+-- automatic update check so it never stalls mpv spawning the binary.
+local function installed_version_async(bin_path, on_done)
+    if not bin_path or bin_path == "" or not utils.file_info(bin_path) then
+        on_done(nil)
+        return
+    end
+    run_command_async({bin_path, "--version"}, function(output)
+        on_done(parse_installed_version(output))
+    end)
 end
 
 -- TorrServer's own asset-naming convention, mapped from the generic
@@ -87,9 +102,9 @@ local function asset_name_for(platform, arch)
     end
 end
 
-local function latest_release(platform)
-    local args = append_args(curl_base_args(), "--max-time", tostring(api_timeout), release_api)
-    local output, err = run_command(args)
+-- Shared by latest_release and latest_release_async: turns the GitHub API
+-- response body into a release table (or nil, error).
+local function parse_release_response(output, err, platform)
     if not output then
         return nil, err or "failed to fetch latest release"
     end
@@ -134,27 +149,45 @@ local function latest_release(platform)
     }, nil
 end
 
--- Wraps latest_release() with an on-disk TTL cache, so callers that check
--- passively/repeatedly (e.g. every time a menu returns to its root) don't
--- hit the release API on every single call. Falls back to a stale cached
--- entry if the network call fails, so a temporary outage doesn't erase the
--- last known result.
-local function cached_latest_release(platform, cache_path, ttl_seconds)
+local function latest_release(platform)
+    local args = append_args(curl_base_args(), "--max-time", tostring(api_timeout), release_api)
+    local output, err = run_command(args)
+    return parse_release_response(output, err, platform)
+end
+
+-- Non-blocking counterpart; on_done(release_or_nil, error_text).
+local function latest_release_async(platform, on_done)
+    local args = append_args(curl_base_args(), "--max-time", tostring(api_timeout), release_api)
+    run_command_async(args, function(output, err)
+        on_done(parse_release_response(output, err, platform))
+    end)
+end
+
+-- Wraps latest_release_async() with an on-disk TTL cache, so callers that
+-- check passively/repeatedly (e.g. every time a menu returns to its root)
+-- don't hit the release API on every single call, and never block mpv while
+-- doing so. Falls back to a stale cached entry if the network call fails, so
+-- a temporary outage doesn't erase the last known result.
+local function cached_latest_release_async(platform, cache_path, ttl_seconds, on_done)
     local cached = shared.read_json_file(cache_path)
     local now = os.time()
     if cached and cached.checked_at and cached.release and (now - cached.checked_at) < (ttl_seconds or 86400) then
-        return cached.release, nil
+        on_done(cached.release, nil)
+        return
     end
 
-    local release, err = latest_release(platform)
-    if release then
-        shared.write_json_file(cache_path, {checked_at = now, release = release}, true)
-        return release, nil
-    end
-    if cached and cached.release then
-        return cached.release, nil
-    end
-    return nil, err
+    latest_release_async(platform, function(release, err)
+        if release then
+            shared.write_json_file(cache_path, {checked_at = now, release = release}, true)
+            on_done(release, nil)
+            return
+        end
+        if cached and cached.release then
+            on_done(cached.release, nil)
+            return
+        end
+        on_done(nil, err)
+    end)
 end
 
 -- Non-blocking download with progress. on_progress(percent) fires roughly
@@ -232,8 +265,10 @@ end
 
 return {
     installed_version = installed_version,
+    installed_version_async = installed_version_async,
     latest_release = latest_release,
-    cached_latest_release = cached_latest_release,
+    latest_release_async = latest_release_async,
+    cached_latest_release_async = cached_latest_release_async,
     download_async = download_async,
     replace_binary = replace_binary,
     default_bin_name = default_bin_name,
